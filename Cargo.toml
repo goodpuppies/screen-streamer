@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-scap = "0.0.8"
+scap = { path = "vendor/scap" }
 socket2 = "0.5.5"
 flate2 = "1.0.26"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+input-linux = "0.7.1"
+libc = "0.2"
