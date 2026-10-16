@@ -76,13 +76,13 @@ impl GraphicsCaptureApiHandler for Capturer {
         frame: &mut WCFrame,
         _: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        let elapsed = frame.timespan().Duration - self.start_time.0;
+        // Windows capture timestamps use 100 ns units; QPC uses perf_freq ticks/second.
+        let elapsed = frame.timestamp().Duration as f64 / 10_000_000.0
+            - self.start_time.0 as f64 / self.perf_freq as f64;
         let display_time = self
             .start_time
             .1
-            .checked_add(Duration::from_secs_f64(
-                elapsed as f64 / self.perf_freq as f64,
-            ))
+            .checked_add(Duration::from_secs_f64(elapsed.max(0.0)))
             .unwrap();
 
         match &self.crop {
@@ -215,10 +215,10 @@ pub fn create_capturer(
             WCMonitor::from_raw_hmonitor(display.raw_handle.0),
             show_cursor,
             draw_border,
-            color_format,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
+            color_format,
             FlagStruct {
                 tx: tx.clone(),
                 crop: Some(get_crop_area(options)),
