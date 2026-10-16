@@ -1,5 +1,7 @@
 use std::{
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    collections::HashMap,
+    os::fd::{FromRawFd, OwnedFd},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -7,7 +9,7 @@ use dbus::{
     arg::{self, PropMap, RefArg, Variant},
     blocking::{Connection, Proxy},
     message::MatchRule,
-    strings::{BusName, Interface},
+    strings::BusName,
 };
 
 use super::error::LinCapError;
@@ -212,7 +214,11 @@ macro_rules! match_response {
                     "The user interaction was ended in some other way",
                 )));
             }
-            _ => unreachable!(),
+            other => {
+                return Err(LinCapError::new(format!(
+                    "Unknown portal response code: {other}"
+                )))
+            }
         }
     };
 }
@@ -222,10 +228,12 @@ pub struct ScreenCastPortal<'a> {
     token: String,
     cursor_mode: Option<u32>,
     restore_token: Option<String>,
+    version: u32,
+    responses: Arc<Mutex<HashMap<String, OrgFreedesktopPortalRequestResponse>>>,
 }
 
 impl<'a> ScreenCastPortal<'a> {
-    pub fn new(connection: &'a Connection) -> Self {
+    pub fn new(connection: &'a Connection) -> Result<Self, LinCapError> {
         let proxy = connection.with_proxy(
             "org.freedesktop.portal.Desktop",
             "/org/freedesktop/portal/desktop",
@@ -234,12 +242,30 @@ impl<'a> ScreenCastPortal<'a> {
 
         let token = format!("scap_{}", rand::random::<u16>());
 
-        Self {
+        // Subscribe before any method call: Gamescope can respond immediately.
+        let responses = Arc::new(Mutex::new(HashMap::new()));
+        let received = responses.clone();
+        let mut rule = MatchRule::new_signal("org.freedesktop.portal.Request", "Response");
+        rule.sender = Some(BusName::from("org.freedesktop.portal.Desktop"));
+        connection.add_match(
+            rule,
+            move |response: OrgFreedesktopPortalRequestResponse, _, message| {
+                if let Some(path) = message.path() {
+                    if let Ok(mut pending) = received.lock() {
+                        pending.insert(path.to_string(), response);
+                    }
+                }
+                true
+            },
+        )?;
+        Ok(Self {
             proxy,
             token,
             cursor_mode: None,
             restore_token: None,
-        }
+            version: 1,
+            responses,
+        })
     }
 
     fn create_session_args(&self) -> arg::PropMap {
@@ -261,19 +287,15 @@ impl<'a> ScreenCastPortal<'a> {
             String::from("handle_token"),
             Variant(Box::new(self.token.clone())),
         );
-        map.insert(
-            String::from("types"),
-            Variant(Box::new(1_u32)),
-        );
+        map.insert(String::from("types"), Variant(Box::new(1_u32)));
         map.insert(String::from("multiple"), Variant(Box::new(false)));
         if let Some(cursor_mode) = self.cursor_mode {
-            map.insert(
-                String::from("cursor_mode"),
-                Variant(Box::new(cursor_mode)),
-            );
+            map.insert(String::from("cursor_mode"), Variant(Box::new(cursor_mode)));
         }
-        map.insert(String::from("persist_mode"), Variant(Box::new(2_u32)));
-        if let Some(token) = &self.restore_token {
+        if self.version >= 4 {
+            map.insert(String::from("persist_mode"), Variant(Box::new(2_u32)));
+        }
+        if let Some(token) = self.restore_token.as_ref().filter(|_| self.version >= 4) {
             map.insert(
                 String::from("restore_token"),
                 Variant(Box::new(token.clone())),
@@ -283,53 +305,31 @@ impl<'a> ScreenCastPortal<'a> {
     }
 
     fn handle_req_response(
-        connection: &Connection,
+        &self,
         path: dbus::Path<'static>,
         iterations: usize,
         timeout: Duration,
-        response: Arc<Mutex<Response>>,
-    ) -> Result<(), dbus::Error> {
-        let got_response = Arc::new(AtomicBool::new(false));
-        let got_response_clone = Arc::clone(&got_response);
-
-        let mut rule = MatchRule::new();
-        rule.path = Some(dbus::Path::from(path));
-        rule.msg_type = Some(dbus::MessageType::Signal);
-        rule.sender = Some(BusName::from("org.freedesktop.portal.Desktop"));
-        rule.interface = Some(Interface::from("org.freedesktop.portal.Request"));
-        connection.add_match(
-            rule,
-            move |res: OrgFreedesktopPortalRequestResponse, _chuh, _msg| {
-                let mut response = response.lock().expect("Failed to lock response mutex");
-                *response = Some(res);
-                got_response_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-                false
-            },
-        )?;
-
+    ) -> Result<OrgFreedesktopPortalRequestResponse, LinCapError> {
         for _ in 0..iterations {
-            connection.process(timeout)?;
-
-            if got_response.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
+            if let Some(response) = self.responses.lock()?.remove(&path.to_string()) {
+                return Ok(response);
             }
+            self.proxy.connection.process(timeout)?;
         }
-
-        Ok(())
+        if let Some(response) = self.responses.lock()?.remove(&path.to_string()) {
+            return Ok(response);
+        }
+        Err(LinCapError::new(
+            "Timed out waiting for the capture portal response".into(),
+        ))
     }
 
     fn create_session(&self) -> Result<dbus::Path, LinCapError> {
         let request_handle = self.proxy.create_session(self.create_session_args())?;
 
         let response = Arc::new(Mutex::new(None));
-        let response_clone = Arc::clone(&response);
-        Self::handle_req_response(
-            self.proxy.connection,
-            request_handle,
-            100,
-            Duration::from_millis(100),
-            response_clone,
-        )?;
+        let value = self.handle_req_response(request_handle, 100, Duration::from_millis(100))?;
+        *response.lock()? = Some(value);
 
         if let Some(res) = response.lock()?.take() {
             match_response!(res.response);
@@ -363,14 +363,12 @@ impl<'a> ScreenCastPortal<'a> {
             .select_sources(session_handle, self.select_sources_args()?)?;
 
         let response = Arc::new(Mutex::new(None));
-        let response_clone = Arc::clone(&response);
-        Self::handle_req_response(
-            self.proxy.connection,
+        let value = self.handle_req_response(
             request_handle,
             1200, // Wait 2 min
             Duration::from_millis(100),
-            response_clone,
         )?;
+        *response.lock()? = Some(value);
 
         if let Some(res) = response.lock()?.take() {
             match_response!(res.response);
@@ -384,14 +382,12 @@ impl<'a> ScreenCastPortal<'a> {
         let request_handle = self.proxy.start(session_handle, "", PropMap::new())?;
 
         let response = Arc::new(Mutex::new(None));
-        let response_clone = Arc::clone(&response);
-        Self::handle_req_response(
-            self.proxy.connection,
+        let value = self.handle_req_response(
             request_handle,
-            100, // Wait 10 s
+            1200, // Allow time for the user's source-selection dialog.
             Duration::from_millis(100),
-            response_clone,
         )?;
+        *response.lock()? = Some(value);
 
         if let Some(res) = response.lock()?.take() {
             match_response!(res.response);
@@ -418,10 +414,16 @@ impl<'a> ScreenCastPortal<'a> {
         Err(LinCapError::new(String::from("Did not get response")))
     }
 
-    pub fn create_stream(&self) -> Result<(Stream, Option<String>), LinCapError> {
+    pub fn create_stream(&self) -> Result<(Stream, Option<String>, OwnedFd), LinCapError> {
         let session_handle = self.create_session()?;
         self.select_sources(session_handle.clone())?;
-        self.start(session_handle)
+        let (stream, token) = self.start(session_handle.clone())?;
+        let remote = self
+            .proxy
+            .open_pipe_wire_remote(session_handle, PropMap::new())?;
+        // D-Bus transfers ownership of this descriptor to us; PipeWire consumes it once.
+        let remote = unsafe { OwnedFd::from_raw_fd(remote.into_fd()) };
+        Ok((stream, token, remote))
     }
 
     pub fn restore_token(mut self, token: Option<String>) -> Self {
@@ -430,6 +432,15 @@ impl<'a> ScreenCastPortal<'a> {
     }
 
     pub fn show_cursor(mut self, mode: bool) -> Result<Self, LinCapError> {
+        self.version = self.proxy.version()?;
+        if self.proxy.available_source_types()? & 1 == 0 {
+            return Err(LinCapError::new(
+                "The selected session portal offers no monitor capture source".into(),
+            ));
+        }
+        if self.version < 2 {
+            return Ok(self);
+        }
         let available_modes = self.proxy.available_cursor_modes()?;
         if mode && available_modes & 2 == 2 {
             self.cursor_mode = Some(2);

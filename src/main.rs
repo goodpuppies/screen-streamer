@@ -258,7 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
   }
 
-  println!("✅ Platform supported and permission granted");
+  println!("Capture backend supported; requesting a capture session...");
 
   // Linux chooses the target interactively through the ScreenCast portal.
   #[cfg(target_os = "linux")]
@@ -283,7 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   };
 
   // Create capturer and get frame size
-  let mut capturer = Capturer::build(options).expect("Failed to create capturer");
+  let mut capturer = Capturer::build(options)?;
   if let Some(token) = capturer.restore_token() {
     save_restore_token(&capture_token_path, token)?;
   }
@@ -305,7 +305,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let mut last_fps_print = Instant::now();
 
   #[cfg(target_os = "linux")]
-  let input_tx = spawn_uinput();
+  let input_tx = if env::args().any(|arg| arg == "--no-input") {
+    None
+  } else {
+    Some(spawn_uinput())
+  };
 
   // Forward line-oriented control commands from PetPlay.
   let (tx, rx) = mpsc::channel::<String>();
@@ -329,8 +333,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Ok(command) = rx.try_recv() {
       #[cfg(target_os = "linux")]
-      if input_tx.send(command).is_err() {
-        break;
+      if let Some(input_tx) = &input_tx {
+        if input_tx.send(command).is_err() {
+          break;
+        }
       }
     }
 
@@ -364,9 +370,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
           is_sending = true;
         }
         Err(e) => {
-          println!("\n❌ Error getting frame: {:?}", e);
-          sleep(Duration::from_millis(1));
-          continue;
+          capturer.stop_capture();
+          return Err(format!("Capture stream ended: {e}").into());
         }
       }
     }

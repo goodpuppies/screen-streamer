@@ -11,3 +11,6 @@ flate2 = "1.0.26"
 [target.'cfg(target_os = "linux")'.dependencies]
 input-linux = "0.7.1"
 libc = "0.2"
+
+[workspace]
+members = ["vendor/scap"]

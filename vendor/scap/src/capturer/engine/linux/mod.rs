@@ -1,11 +1,13 @@
 use std::{
-    mem::size_of,
+    cell::Cell,
+    os::fd::OwnedFd,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU8},
         mpsc::{self, sync_channel, SyncSender},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pipewire as pw;
@@ -15,15 +17,13 @@ use pw::{
     properties::properties,
     spa::{
         self,
+        buffer::DataType,
         param::{
             format::{FormatProperties, MediaSubtype, MediaType},
             video::VideoFormat,
             ParamType,
         },
         pod::{Pod, Property},
-        sys::{
-            spa_buffer, spa_meta_header, SPA_META_Header, SPA_PARAM_META_size, SPA_PARAM_META_type,
-        },
         utils::{Direction, SpaTypes},
     },
     stream::{Stream, StreamRc, StreamState},
@@ -31,13 +31,15 @@ use pw::{
 
 use crate::{
     capturer::Options,
-    frame::{BGRxFrame, Frame, RGBFrame, RGBxFrame, VideoFrame, XBGRFrame},
+    frame::{BGRAFrame, Frame, VideoFrame},
 };
 
 use self::{error::LinCapError, portal::ScreenCastPortal};
 
 mod error;
+mod pixels;
 mod portal;
+use pixels::{pack_bgra, PixelOrder};
 
 static CAPTURER_STATE: AtomicU8 = AtomicU8::new(0);
 static STREAM_STATE_CHANGED_TO_ERROR: AtomicBool = AtomicBool::new(false);
@@ -46,6 +48,7 @@ static STREAM_STATE_CHANGED_TO_ERROR: AtomicBool = AtomicBool::new(false);
 struct ListenerUserData {
     pub tx: mpsc::Sender<Frame>,
     pub format: spa::param::video::VideoInfoRaw,
+    warned_bad_buffer: bool,
 }
 
 fn param_changed_callback(
@@ -69,11 +72,10 @@ fn param_changed_callback(
         return;
     }
 
-    user_data
-        .format
-        .parse(param)
-        // TODO: Tell library user of the error
-        .expect("Failed to parse format parameter");
+    if let Err(error) = user_data.format.parse(param) {
+        eprintln!("capture: invalid PipeWire video format: {error}");
+        STREAM_STATE_CHANGED_TO_ERROR.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn state_changed_callback(
@@ -91,81 +93,62 @@ fn state_changed_callback(
     }
 }
 
-unsafe fn get_timestamp(buffer: *mut spa_buffer) -> i64 {
-    let n_metas = (*buffer).n_metas;
-    if n_metas > 0 {
-        let mut meta_ptr = (*buffer).metas;
-        let metas_end = (*buffer).metas.wrapping_add(n_metas as usize);
-        while meta_ptr != metas_end {
-            if (*meta_ptr).type_ == SPA_META_Header {
-                let meta_header: &mut spa_meta_header =
-                    &mut *((*meta_ptr).data as *mut spa_meta_header);
-                return meta_header.pts;
-            }
-            meta_ptr = meta_ptr.wrapping_add(1);
-        }
-        0
-    } else {
-        0
-    }
-}
-
 fn process_callback(stream: &Stream, user_data: &mut ListenerUserData) {
-    let buffer = unsafe { stream.dequeue_raw_buffer() };
-    if !buffer.is_null() {
-        'outside: {
-            let buffer = unsafe { (*buffer).buffer };
-            if buffer.is_null() {
-                break 'outside;
-            }
-            let n_datas = unsafe { (*buffer).n_datas };
-            if n_datas < 1 {
-                return;
-            }
-            let frame_size = user_data.format.size();
-            let frame_data: Vec<u8> = unsafe {
-                std::slice::from_raw_parts(
-                    (*(*buffer).datas).data as *mut u8,
-                    (*(*buffer).datas).maxsize as usize,
-                )
-                .to_vec()
-            };
-
-            if let Err(e) = match user_data.format.format() {
-                VideoFormat::RGBx => user_data.tx.send(Frame::Video(VideoFrame::RGBx(RGBxFrame {
-                    display_time: std::time::SystemTime::now(),
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                }))),
-                VideoFormat::RGB => user_data.tx.send(Frame::Video(VideoFrame::RGB(RGBFrame {
-                    display_time: std::time::SystemTime::now(),
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                }))),
-                VideoFormat::xBGR => user_data.tx.send(Frame::Video(VideoFrame::XBGR(XBGRFrame {
-                    display_time: std::time::SystemTime::now(),
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                }))),
-                VideoFormat::BGRx => user_data.tx.send(Frame::Video(VideoFrame::BGRx(BGRxFrame {
-                    display_time: std::time::SystemTime::now(),
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                }))),
-                _ => panic!("Unsupported frame format received"),
-            } {
-                eprintln!("{e}");
-            }
+    // The RAII buffer always requeues, including empty/invalid/error paths.
+    let Some(mut buffer) = stream.dequeue_buffer() else {
+        return;
+    };
+    let result = (|| -> Result<Vec<u8>, &'static str> {
+        let datas = buffer.datas_mut();
+        if datas.len() != 1 {
+            return Err("expected one packed video plane");
         }
-    } else {
-        eprintln!("Out of buffers");
+        let plane = &mut datas[0];
+        if plane.type_() != DataType::MemFd && plane.type_() != DataType::MemPtr {
+            return Err("non-CPU buffer received; DMA-BUF import is not enabled");
+        }
+        if plane.as_raw().chunk.is_null() {
+            return Err("missing video chunk");
+        }
+        let chunk = unsafe { *plane.as_raw().chunk };
+        if chunk.flags != 0 {
+            return Err("empty or corrupted video chunk");
+        }
+        let order = match user_data.format.format() {
+            VideoFormat::BGRA => PixelOrder::Bgra,
+            VideoFormat::BGRx => PixelOrder::Bgrx,
+            VideoFormat::RGBA => PixelOrder::Rgba,
+            VideoFormat::RGBx => PixelOrder::Rgbx,
+            _ => return Err("unsupported negotiated pixel format"),
+        };
+        let size = user_data.format.size();
+        let data = plane.data().ok_or("video buffer is not mapped")?;
+        pack_bgra(
+            data,
+            chunk.offset as usize,
+            chunk.size as usize,
+            chunk.stride,
+            size.width,
+            size.height,
+            order,
+        )
+    })();
+    match result {
+        Ok(data) => {
+            let size = user_data.format.size();
+            let _ = user_data.tx.send(Frame::Video(VideoFrame::BGRA(BGRAFrame {
+                display_time: std::time::SystemTime::now(),
+                width: size.width as i32,
+                height: size.height as i32,
+                data,
+            })));
+        }
+        Err(error) if !user_data.warned_bad_buffer => {
+            user_data.warned_bad_buffer = true;
+            eprintln!("capture: dropping invalid PipeWire buffer: {error}");
+        }
+        Err(_) => {}
     }
-
-    unsafe { stream.queue_raw_buffer(buffer) };
 }
 
 // TODO: Format negotiation
@@ -174,16 +157,43 @@ fn pipewire_capturer(
     tx: mpsc::Sender<Frame>,
     ready_sender: &SyncSender<bool>,
     stream_id: u32,
+    remote: OwnedFd,
 ) -> Result<(), LinCapError> {
     pw::init();
 
     let mainloop = MainLoopRc::new(None)?;
     let context = ContextRc::new(&mainloop, None)?;
-    let core = context.connect_rc(None)?;
+    let core = context.connect_fd_rc(remote, None)?;
+
+    // The portal can return while permissions/global announcements are still in flight.
+    // Wait until its source is visible on this restricted remote before targeting it.
+    let registry = core.get_registry_rc()?;
+    let source_ready = Rc::new(Cell::new(false));
+    let ready = source_ready.clone();
+    let _registry_listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            if global.id == stream_id && global.type_ == pw::types::ObjectType::Node {
+                ready.set(true);
+            }
+        })
+        .register();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !source_ready.get() {
+        if Instant::now() >= deadline {
+            return Err(LinCapError::new(format!(
+                "Portal PipeWire node {stream_id} did not become available"
+            )));
+        }
+        mainloop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(100)));
+    }
 
     let user_data = ListenerUserData {
         tx,
         format: Default::default(),
+        warned_bad_buffer: false,
     };
 
     let stream = StreamRc::new(
@@ -213,10 +223,11 @@ fn pipewire_capturer(
             Choice,
             Enum,
             Id,
-            pw::spa::param::video::VideoFormat::RGB,
-            pw::spa::param::video::VideoFormat::RGBA,
-            pw::spa::param::video::VideoFormat::RGBx,
             pw::spa::param::video::VideoFormat::BGRx,
+            pw::spa::param::video::VideoFormat::BGRx,
+            pw::spa::param::video::VideoFormat::BGRA,
+            pw::spa::param::video::VideoFormat::RGBx,
+            pw::spa::param::video::VideoFormat::RGBA,
         ),
         pw::spa::pod::property!(
             FormatProperties::VideoSize,
@@ -235,8 +246,8 @@ fn pipewire_capturer(
             },
             pw::spa::utils::Rectangle {
                 // Max
-                width: 4096,
-                height: 4096,
+                width: 16384,
+                height: 16384,
             }
         ),
         pw::spa::pod::property!(
@@ -249,16 +260,19 @@ fn pipewire_capturer(
         ),
     );
 
-    let metas_obj = pw::spa::pod::object!(
-        SpaTypes::ObjectParamMeta,
-        ParamType::Meta,
+    // Request CPU-mappable buffers. Do not accidentally negotiate DMA-BUF then dereference it.
+    let buffers_obj = pw::spa::pod::object!(
+        SpaTypes::ObjectParamBuffers,
+        ParamType::Buffers,
         Property::new(
-            SPA_PARAM_META_type,
-            pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_META_Header))
-        ),
-        Property::new(
-            SPA_PARAM_META_size,
-            pw::spa::pod::Value::Int(size_of::<pw::spa::sys::spa_meta_header>() as i32)
+            spa::sys::SPA_PARAM_BUFFERS_dataType,
+            pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(pw::spa::utils::Choice(
+                pw::spa::utils::ChoiceFlags::empty(),
+                pw::spa::utils::ChoiceEnum::Flags {
+                    default: (1 << spa::sys::SPA_DATA_MemFd) | (1 << spa::sys::SPA_DATA_MemPtr),
+                    flags: vec![],
+                }
+            )))
         ),
     );
 
@@ -268,16 +282,16 @@ fn pipewire_capturer(
     )?
     .0
     .into_inner();
-    let metas_values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+    let buffers_values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
-        &pw::spa::pod::Value::Object(metas_obj),
+        &pw::spa::pod::Value::Object(buffers_obj),
     )?
     .0
     .into_inner();
 
     let mut params = [
         pw::spa::pod::Pod::from_bytes(&values).unwrap(),
-        pw::spa::pod::Pod::from_bytes(&metas_values).unwrap(),
+        pw::spa::pod::Pod::from_bytes(&buffers_values).unwrap(),
     ];
 
     stream.connect(
@@ -316,37 +330,39 @@ pub struct LinuxCapturer {
 
 impl LinuxCapturer {
     // TODO: Error handling
-    pub fn new(options: &Options, tx: mpsc::Sender<Frame>) -> Self {
-        let connection =
-            dbus::blocking::Connection::new_session().expect("Failed to create dbus connection");
-        let (portal_stream, restore_token) = ScreenCastPortal::new(&connection)
-            .show_cursor(options.show_cursor)
-            .expect("Unsupported cursor mode")
+    pub fn new(options: &Options, tx: mpsc::Sender<Frame>) -> Result<Self, LinCapError> {
+        let connection = dbus::blocking::Connection::new_session().map_err(|e|
+            LinCapError::new(format!("Cannot connect to the capture session bus; launch from the graphical session or configure its bus address: {e}")))?;
+        let (portal_stream, restore_token, remote) = ScreenCastPortal::new(&connection)?
+            .show_cursor(options.show_cursor)?
             .restore_token(options.restore_token.clone())
-            .create_stream()
-            .expect("Failed to get screencast stream");
+            .create_stream()?;
         let stream_id = portal_stream.pw_node_id();
+        eprintln!("capture: portal selected PipeWire node {stream_id}");
 
         // TODO: Fix this hack
         let options = options.clone();
         let (ready_sender, ready_recv) = sync_channel(1);
         let capturer_join_handle = std::thread::spawn(move || {
-            let res = pipewire_capturer(options, tx, &ready_sender, stream_id);
-            if res.is_err() {
-                ready_sender.send(false)?;
+            let res = pipewire_capturer(options, tx, &ready_sender, stream_id, remote);
+            if let Err(error) = &res {
+                eprintln!("capture: PipeWire setup failed: {error}");
+                let _ = ready_sender.send(false);
             }
             res
         });
 
-        if !ready_recv.recv().expect("Failed to receive") {
-            panic!("Failed to setup capturer");
+        if ready_recv.recv() != Ok(true) {
+            return Err(LinCapError::new(
+                "Failed to initialize the portal PipeWire remote".into(),
+            ));
         }
 
-        Self {
+        Ok(Self {
             capturer_join_handle: Some(capturer_join_handle),
             _connection: connection,
             restore_token,
-        }
+        })
     }
 
     pub fn restore_token(&self) -> Option<&str> {
@@ -369,6 +385,15 @@ impl LinuxCapturer {
     }
 }
 
-pub fn create_capturer(options: &Options, tx: mpsc::Sender<Frame>) -> LinuxCapturer {
+pub fn create_capturer(
+    options: &Options,
+    tx: mpsc::Sender<Frame>,
+) -> Result<LinuxCapturer, LinCapError> {
     LinuxCapturer::new(options, tx)
+}
+
+impl Drop for LinuxCapturer {
+    fn drop(&mut self) {
+        self.stop_capture();
+    }
 }

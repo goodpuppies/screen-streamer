@@ -17,7 +17,8 @@ SDK. Cross builds require the corresponding target toolchain, linker and native 
 
 The helper connects to a local TCP receiver. Supported options are `--fps=<1..240>` (default 60),
 `--port=<port>` (default 12345), and `--capture-token-path=<file>` for persistent portal restoration.
-`--version` exits without starting capture or requesting permissions.
+`--version` exits without starting capture or requesting permissions. On Linux, `--no-input`
+disables uinput setup for capture-only use and isolated tests.
 
 The canonical TypeScript receiver and process supervisor live in PetPlay's
 `classes/ScreenCapturer/`; the TS files in this repository are older standalone examples.
