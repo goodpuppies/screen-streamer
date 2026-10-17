@@ -200,6 +200,10 @@ impl Stream {
     }
 }
 
+fn step(name: &str, error: LinCapError) -> LinCapError {
+    LinCapError::new(format!("{name}: {error}"))
+}
+
 macro_rules! match_response {
     ( $code:expr ) => {
         match $code {
@@ -415,9 +419,19 @@ impl<'a> ScreenCastPortal<'a> {
     }
 
     pub fn create_stream(&self) -> Result<(Stream, Option<String>, OwnedFd), LinCapError> {
-        let session_handle = self.create_session()?;
-        self.select_sources(session_handle.clone())?;
-        let (stream, token) = self.start(session_handle.clone())?;
+        // Step names go to stderr so a failure says which request the portal ended.
+        eprintln!(
+            "portal: version {} cursor_mode {:?} restore_token {}",
+            self.version,
+            self.cursor_mode,
+            if self.restore_token.is_some() { "present" } else { "none" }
+        );
+        let session_handle = self.create_session().map_err(|e| step("CreateSession", e))?;
+        eprintln!("portal: CreateSession ok");
+        self.select_sources(session_handle.clone()).map_err(|e| step("SelectSources", e))?;
+        eprintln!("portal: SelectSources ok");
+        let (stream, token) = self.start(session_handle.clone()).map_err(|e| step("Start", e))?;
+        eprintln!("portal: Start ok (node {})", stream.pw_node_id());
         let remote = self
             .proxy
             .open_pipe_wire_remote(session_handle, PropMap::new())?;
