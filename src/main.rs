@@ -1,5 +1,6 @@
 use scap::capturer::{Capturer, Options};
 use scap::frame::{Frame, VideoFrame};
+use std::error::Error;
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,11 @@ use std::sync::mpsc;
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 use std::{env, str::FromStr};
+
+#[cfg(target_os = "windows")]
+mod windows_workspace;
+#[cfg(any(target_os = "windows", test))]
+mod workspace;
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
 const USE_RGBA_CONVERSION: bool = false; // Toggle BGRA to RGBA conversion
@@ -232,6 +238,121 @@ fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
   rgba
 }
 
+/// The raw image of a video frame, or `None` for any other kind of frame.
+pub(crate) fn bgra_frame(frame: Frame) -> Option<(Vec<u8>, u32, u32)> {
+  let (data, width, height) = match frame {
+    Frame::Video(VideoFrame::BGRA(frame)) => (frame.data, frame.width, frame.height),
+    Frame::Video(VideoFrame::BGRx(frame)) => (frame.data, frame.width, frame.height),
+    Frame::Video(VideoFrame::XBGR(frame)) => (frame.data, frame.width, frame.height),
+    Frame::Video(VideoFrame::RGBx(frame)) => {
+      (bgra_to_rgba(&frame.data), frame.width, frame.height)
+    }
+    _ => return None,
+  };
+  Some((data, width.max(1) as u32, height.max(1) as u32))
+}
+
+pub(crate) fn capture_options(
+  target: Option<scap::Target>,
+  fps: u64,
+  token_path: &Path,
+) -> Options {
+  Options {
+    fps: fps as u32,
+    target,
+    show_cursor: true,
+    show_highlight: false,
+    excluded_targets: None,
+    output_type: scap::frame::FrameType::BGRAFrame,
+    output_resolution: scap::capturer::Resolution::Captured,
+    crop_area: None, // Use full display area
+    restore_token: read_restore_token(token_path),
+    ..Default::default()
+  }
+}
+
+enum Capture {
+  Single(Capturer),
+  #[cfg(target_os = "windows")]
+  Stitched(windows_workspace::StitchedCapture),
+}
+
+impl Capture {
+  fn frame_size(&mut self) -> [u32; 2] {
+    match self {
+      Capture::Single(capturer) => capturer.get_output_frame_size(),
+      #[cfg(target_os = "windows")]
+      Capture::Stitched(stitched) => stitched.frame_size(),
+    }
+  }
+
+  fn start(&mut self) {
+    match self {
+      Capture::Single(capturer) => capturer.start_capture(),
+      // Each monitor's capture started with the stitcher.
+      #[cfg(target_os = "windows")]
+      Capture::Stitched(_) => {}
+    }
+  }
+
+  fn stop(&mut self) {
+    match self {
+      Capture::Single(capturer) => capturer.stop_capture(),
+      // The monitor threads end with the process, right after this.
+      #[cfg(target_os = "windows")]
+      Capture::Stitched(_) => {}
+    }
+  }
+
+  fn next_frame(&mut self) -> Result<Option<(Vec<u8>, u32, u32)>, String> {
+    match self {
+      Capture::Single(capturer) => {
+        let frame = capturer.get_next_frame().map_err(|e| e.to_string())?;
+        Ok(bgra_frame(frame))
+      }
+      #[cfg(target_os = "windows")]
+      Capture::Stitched(stitched) => stitched.next_frame().map(Some),
+    }
+  }
+}
+
+/// Linux chooses the target interactively through the ScreenCast portal.
+#[cfg(target_os = "linux")]
+fn open_capture(fps: u64, token_path: &Path) -> Result<Capture, Box<dyn Error>> {
+  open_single_capture(None, fps, token_path)
+}
+
+#[cfg(target_os = "windows")]
+fn open_capture(fps: u64, token_path: &Path) -> Result<Capture, Box<dyn Error>> {
+  windows_workspace::use_physical_pixels();
+  let monitors = windows_workspace::monitor_targets();
+  if monitors.len() > 1 {
+    let stitched = windows_workspace::StitchedCapture::start(monitors, fps, token_path)?;
+    return Ok(Capture::Stitched(stitched));
+  }
+  open_single_capture(windows_workspace::first_target(monitors), fps, token_path)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn open_capture(fps: u64, token_path: &Path) -> Result<Capture, Box<dyn Error>> {
+  let target = scap::get_all_targets()
+    .into_iter()
+    .find(|t| matches!(t, scap::Target::Display(_)));
+  open_single_capture(target, fps, token_path)
+}
+
+fn open_single_capture(
+  target: Option<scap::Target>,
+  fps: u64,
+  token_path: &Path,
+) -> Result<Capture, Box<dyn Error>> {
+  let capturer = Capturer::build(capture_options(target, fps, token_path))?;
+  if let Some(token) = capturer.restore_token() {
+    save_restore_token(token_path, token)?;
+  }
+  Ok(Capture::Single(capturer))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
   if env::args().any(|arg| arg == "--version") {
     println!("screen-streamer {}", env!("CARGO_PKG_VERSION"));
@@ -260,34 +381,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   println!("Capture backend supported; requesting a capture session...");
 
-  // Linux chooses the target interactively through the ScreenCast portal.
-  #[cfg(target_os = "linux")]
-  let target = None;
-  #[cfg(not(target_os = "linux"))]
-  let target = scap::get_all_targets()
-    .into_iter()
-    .find(|t| matches!(t, scap::Target::Display(_)));
-
-  // Create Options for screen capture
-  let options = Options {
-    fps: target_fps as u32,
-    target,
-    show_cursor: true,
-    show_highlight: false,
-    excluded_targets: None,
-    output_type: scap::frame::FrameType::BGRAFrame,
-    output_resolution: scap::capturer::Resolution::Captured,
-    crop_area: None, // Use full display area
-    restore_token: read_restore_token(&capture_token_path),
-    ..Default::default()
-  };
-
-  // Create capturer and get frame size
-  let mut capturer = Capturer::build(options)?;
-  if let Some(token) = capturer.restore_token() {
-    save_restore_token(&capture_token_path, token)?;
-  }
-  let [mut width, mut height] = capturer.get_output_frame_size();
+  let mut capture = open_capture(target_fps, &capture_token_path)?;
+  let [mut width, mut height] = capture.frame_size();
 
   // Connect to TCP server
   println!("\n🔌 Connecting to 127.0.0.1:{port}");
@@ -324,7 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   });
 
   // Start capture
-  capturer.start_capture();
+  capture.start();
   println!("\n🎥 Started capture. Press Enter to stop...");
   println!("\nStreaming... ");
 
@@ -342,35 +437,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // If we're not currently sending, try to get a new frame
     if !is_sending {
-      match capturer.get_next_frame() {
-        Ok(frame) => {
-          // Get the raw bytes from the frame
-          let (bgra_data, frame_width, frame_height) = match frame {
-            Frame::Video(VideoFrame::BGRA(frame)) => (frame.data, frame.width, frame.height),
-            Frame::Video(VideoFrame::BGRx(frame)) => (frame.data, frame.width, frame.height),
-            Frame::Video(VideoFrame::XBGR(frame)) => (frame.data, frame.width, frame.height),
-            Frame::Video(VideoFrame::RGBx(frame)) => {
-              (bgra_to_rgba(&frame.data), frame.width, frame.height)
-            }
-            _ => {
-              println!("\n❌ Unexpected frame format");
-              sleep(Duration::from_millis(1));
-              continue;
-            }
-          };
-          width = frame_width.max(1) as u32;
-          height = frame_height.max(1) as u32;
+      match capture.next_frame() {
+        Ok(Some((bgra_data, frame_width, frame_height))) => {
+          width = frame_width;
+          height = frame_height;
 
           // Convert and store the frame
           current_frame = Some(if USE_RGBA_CONVERSION {
             bgra_to_rgba(&bgra_data)
           } else {
-            bgra_data.to_vec()
+            bgra_data
           });
           is_sending = true;
         }
+        Ok(None) => {
+          println!("\n❌ Unexpected frame format");
+          sleep(Duration::from_millis(1));
+          continue;
+        }
         Err(e) => {
-          capturer.stop_capture();
+          capture.stop();
           return Err(format!("Capture stream ended: {e}").into());
         }
       }
@@ -445,7 +531,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   }
 
   // Stop Capture
-  capturer.stop_capture();
+  capture.stop();
   println!("\n👋 Capture stopped");
   Ok(())
 }
