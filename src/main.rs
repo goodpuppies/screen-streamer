@@ -9,6 +9,8 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 use std::{env, str::FromStr};
 
+mod control_input;
+
 #[cfg(target_os = "windows")]
 mod windows_workspace;
 #[cfg(any(target_os = "windows", test))]
@@ -406,15 +408,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Some(spawn_uinput())
   };
 
-  // Forward line-oriented control commands from PetPlay.
-  let (tx, rx) = mpsc::channel::<String>();
-  thread::spawn(move || loop {
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).unwrap_or(0) == 0 {
-      break;
-    }
-    if tx.send(input).is_err() {
-      break;
+  // Input has its own blocking reader and uinput consumer. A slow capture or
+  // frame socket must not delay a key press/release until the next capture tick.
+  thread::spawn(move || {
+    #[cfg(target_os = "linux")]
+    let send = move |line| match &input_tx {
+      Some(tx) => tx.send(line).is_ok(),
+      None => true, // --no-input drains stdin without creating input devices
+    };
+    #[cfg(not(target_os = "linux"))]
+    let send = |_line| true;
+    if let Err(error) = control_input::forward_control_lines(io::stdin().lock(), send) {
+      eprintln!("control input read failed: {error}");
     }
   });
 
@@ -425,15 +430,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   loop {
     let frame_start = Instant::now();
-
-    while let Ok(command) = rx.try_recv() {
-      #[cfg(target_os = "linux")]
-      if let Some(input_tx) = &input_tx {
-        if input_tx.send(command).is_err() {
-          break;
-        }
-      }
-    }
 
     // If we're not currently sending, try to get a new frame
     if !is_sending {
