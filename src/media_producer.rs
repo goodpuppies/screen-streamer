@@ -200,7 +200,8 @@ impl MediaProducer {
           .copy_from_slice(&bgra[y * source_row..y * source_row + row]);
       }
       Ok(())
-    })??;
+    })
+    .map_err(|error| Error::new(error.kind(), format!("map a {width}x{height} slot: {error}")))??;
     let mut header = [0u8; HEADER];
     header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     header[4..8].copy_from_slice(&VERSION.to_le_bytes());
@@ -216,7 +217,8 @@ impl MediaProducer {
     let exported = slot.buffer.fd().map_err(|error| {
       Error::new(ErrorKind::Other, format!("export the slot's DMA-BUF: {error}"))
     })?;
-    send_descriptor(self.socket.as_fd(), &header, exported.as_fd())?;
+    send_descriptor(self.socket.as_fd(), &header, exported.as_fd())
+      .map_err(|error| Error::new(error.kind(), format!("send frame {sequence}: {error}")))?;
     self.slots[index].pending = Some(sequence);
     self.sequence = sequence;
     self.published += 1;
@@ -236,7 +238,10 @@ impl MediaProducer {
         )
       };
       if read < 0 {
-        let error = Error::last_os_error();
+        let error = Error::new(
+          Error::last_os_error().kind(),
+          format!("read a slot release: {}", Error::last_os_error()),
+        );
         return match error.kind() {
           ErrorKind::WouldBlock | ErrorKind::Interrupted => Ok(()),
           _ => Err(error),

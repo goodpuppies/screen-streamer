@@ -497,6 +497,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !media_socket.is_empty() {
       if let Some(frame_data) = current_frame.as_deref() {
         if media.is_none() {
+          println!("\n🎞️ First captured frame: {width}x{height}, {} bytes", frame_data.len());
           let producer = media_producer::MediaProducer::connect(
             Path::new(&media_socket),
             &media_render_node,
@@ -522,8 +523,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Try to send the current frame
     if let Some(frame_data) = current_frame.take() {
       let Some(socket) = socket.as_mut() else {
+        // Nothing consumes the frame socket, so the media producer's own counters are
+        // the only progress signal this session has.
         frame_count += 1;
         is_sending = false;
+        if last_fps_print.elapsed().as_secs() >= 1 {
+          #[cfg(target_os = "linux")]
+          if let Some(producer) = media.as_ref() {
+            print!(
+              "\r🎬 FPS: {:.1} | published: {} | dropped: {}    ",
+              frame_count as f64 / last_fps_print.elapsed().as_secs_f64(),
+              producer.published(),
+              producer.dropped()
+            );
+            io::stdout().flush().unwrap();
+          }
+          frame_count = 0;
+          last_fps_print = Instant::now();
+        }
         continue;
       };
       // Send frame metadata

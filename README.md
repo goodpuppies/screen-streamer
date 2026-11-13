@@ -35,6 +35,9 @@ reads back. An odd capture width or height is cropped by one pixel, because H.26
 it; a capture that shrinks mid-session ends the producer, since a receiver has already been told
 the stream's geometry. A full slot pool drops the capture attempt rather than delaying capture.
 
+Without a frame socket the producer's published and dropped counts replace the frame socket's
+throughput line, since they are then the only progress signal.
+
 `examples/media_pattern.rs` publishes a moving synthetic pattern through the same code, which
 exercises allocation, export, the descriptor, acknowledgements and the GPU encoder without a
 capture portal and without putting real screen content into an encoded stream:
