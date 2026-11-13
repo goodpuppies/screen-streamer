@@ -11,6 +11,9 @@ use std::{env, str::FromStr};
 
 mod control_input;
 
+#[cfg(target_os = "linux")]
+mod media_producer;
+
 #[cfg(target_os = "windows")]
 mod windows_workspace;
 #[cfg(any(target_os = "windows", test))]
@@ -366,6 +369,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     "capture-token-path",
     String::from("screen-streamer-capture.token"),
   ));
+  // An explicit media socket publishes to the native encoder as well. The frame socket
+  // stays the default so the existing in-headset overlay keeps working unchanged.
+  #[cfg(target_os = "linux")]
+  let media_socket = argument("media-socket", String::new());
+  #[cfg(target_os = "linux")]
+  let media_render_node = PathBuf::from(argument(
+    "media-render-node",
+    String::from("/dev/dri/renderD128"),
+  ));
+  let frame_socket_wanted = !env::args().any(|arg| arg == "--no-frame-socket");
+  #[cfg(target_os = "linux")]
+  if media_socket.is_empty() && !frame_socket_wanted {
+    return Err("--no-frame-socket needs --media-socket=PATH to have any destination".into());
+  }
+  #[cfg(not(target_os = "linux"))]
+  if !frame_socket_wanted {
+    return Err("--no-frame-socket is only available with the Linux media socket".into());
+  }
   // Check if the platform is supported
   if !scap::is_supported() {
     println!("❌ Platform not supported");
@@ -387,9 +408,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let [mut width, mut height] = capture.frame_size();
 
   // Connect to TCP server
-  println!("\n🔌 Connecting to 127.0.0.1:{port}");
-  let mut socket = TcpStream::connect(("127.0.0.1", port))?;
-  println!("✅ Connected to server");
+  let mut socket = if frame_socket_wanted {
+    println!("\n🔌 Connecting to 127.0.0.1:{port}");
+    let stream = TcpStream::connect(("127.0.0.1", port))?;
+    println!("✅ Connected to server");
+    Some(stream)
+  } else {
+    println!("\n🔌 Frame socket disabled; publishing to the media socket only");
+    None
+  };
+  // Created from the first captured frame, whose size can differ from the negotiated
+  // capture size, and whose odd dimensions the encoder cannot accept.
+  #[cfg(target_os = "linux")]
+  let mut media: Option<media_producer::MediaProducer> = None;
+  #[cfg(target_os = "linux")]
+  let mut media_reported = false;
 
   // Calculate buffer sizes based on resolution
   println!("⚙️ Capture target: {width}x{height} @ {target_fps}fps (max)");
@@ -458,8 +491,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       }
     }
 
+    // Hand the frame to the native encoder first. It copies into GPU-visible memory
+    // and returns; a full slot pool drops the frame instead of delaying capture.
+    #[cfg(target_os = "linux")]
+    if !media_socket.is_empty() {
+      if let Some(frame_data) = current_frame.as_deref() {
+        if media.is_none() {
+          let producer = media_producer::MediaProducer::connect(
+            Path::new(&media_socket),
+            &media_render_node,
+            width & !1,
+            height & !1,
+          )?;
+          println!(
+            "\n🎞️ Media producer connected: {}x{} from a {width}x{height} capture",
+            producer.geometry().0,
+            producer.geometry().1
+          );
+          media = Some(producer);
+        }
+        let producer = media.as_mut().unwrap();
+        producer.publish(frame_data, width, height)?;
+        if !media_reported && producer.published() > 0 {
+          media_reported = true;
+          println!("🎞️ First frame published to the media socket");
+        }
+      }
+    }
+
     // Try to send the current frame
     if let Some(frame_data) = current_frame.take() {
+      let Some(socket) = socket.as_mut() else {
+        frame_count += 1;
+        is_sending = false;
+        continue;
+      };
       // Send frame metadata
       let total_size = frame_data.len() as u32;
       let num_chunks = ((total_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;

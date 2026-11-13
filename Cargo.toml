@@ -11,6 +11,9 @@ flate2 = "1.0.26"
 [target.'cfg(target_os = "linux")'.dependencies]
 input-linux = "0.7.1"
 libc = "0.2"
+# Linear GBM buffers are CPU-writable and DMA-BUF exportable, so a captured frame
+# reaches the GPU encoder through its strict DMA-BUF contract.
+gbm = { version = "0.18", default-features = false }
 
 [workspace]
 members = ["vendor/scap"]
