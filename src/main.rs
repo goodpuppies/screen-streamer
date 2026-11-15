@@ -331,6 +331,9 @@ fn open_capture(fps: u64, token_path: &Path) -> Result<Capture, Box<dyn Error>> 
 fn open_capture(fps: u64, token_path: &Path) -> Result<Capture, Box<dyn Error>> {
   windows_workspace::use_physical_pixels();
   let monitors = windows_workspace::monitor_targets();
+  if env::args().any(|arg| arg == "--single-monitor") {
+    return open_single_capture(windows_workspace::first_target(monitors), fps, token_path);
+  }
   if monitors.len() > 1 {
     let stitched = windows_workspace::StitchedCapture::start(monitors, fps, token_path)?;
     return Ok(Capture::Stitched(stitched));
