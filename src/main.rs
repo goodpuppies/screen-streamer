@@ -426,6 +426,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let mut media: Option<media_producer::MediaProducer> = None;
   #[cfg(target_os = "linux")]
   let mut media_reported = false;
+  // Media publishing is a second consumer: when its worker is missing or goes away, capture and
+  // the frame socket carry on, and the producer reconnects after this long.
+  #[cfg(target_os = "linux")]
+  const MEDIA_RETRY: Duration = Duration::from_secs(1);
+  #[cfg(target_os = "linux")]
+  let mut media_retry_at: Option<Instant> = None;
 
   // Calculate buffer sizes based on resolution
   println!("⚙️ Capture target: {width}x{height} @ {target_fps}fps (max)");
@@ -499,26 +505,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     if !media_socket.is_empty() {
       if let Some(frame_data) = current_frame.as_deref() {
-        if media.is_none() {
-          println!("\n🎞️ First captured frame: {width}x{height}, {} bytes", frame_data.len());
-          let producer = media_producer::MediaProducer::connect(
+        if media.is_none() && media_retry_at.map_or(true, |at| Instant::now() >= at) {
+          println!("\n🎞️ Captured frame: {width}x{height}, {} bytes", frame_data.len());
+          match media_producer::MediaProducer::connect(
             Path::new(&media_socket),
             &media_render_node,
             width & !1,
             height & !1,
-          )?;
-          println!(
-            "\n🎞️ Media producer connected: {}x{} from a {width}x{height} capture",
-            producer.geometry().0,
-            producer.geometry().1
-          );
-          media = Some(producer);
+          ) {
+            Ok(producer) => {
+              println!(
+                "\n🎞️ Media producer connected: {}x{} from a {width}x{height} capture",
+                producer.geometry().0,
+                producer.geometry().1
+              );
+              media = Some(producer);
+              media_retry_at = None;
+            }
+            Err(error) => {
+              eprintln!("⚠️ Media socket unavailable: {error}; retrying in {MEDIA_RETRY:?}");
+              media_retry_at = Some(Instant::now() + MEDIA_RETRY);
+            }
+          }
         }
-        let producer = media.as_mut().unwrap();
-        producer.publish(frame_data, width, height)?;
-        if !media_reported && producer.published() > 0 {
-          media_reported = true;
-          println!("🎞️ First frame published to the media socket");
+        if let Some(producer) = media.as_mut() {
+          match producer.publish(frame_data, width, height) {
+            Ok(_) => {
+              if !media_reported && producer.published() > 0 {
+                media_reported = true;
+                println!("🎞️ First frame published to the media socket");
+              }
+            }
+            Err(error) => {
+              eprintln!("⚠️ Media publishing stopped: {error}; reconnecting in {MEDIA_RETRY:?}");
+              media = None;
+              media_reported = false;
+              media_retry_at = Some(Instant::now() + MEDIA_RETRY);
+            }
+          }
         }
       }
     }
