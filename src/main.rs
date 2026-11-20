@@ -366,6 +366,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("screen-streamer {}", env!("CARGO_PKG_VERSION"));
     return Ok(());
   }
+  // Input injection alone: the same stdin verbs (M/B/W/K) into uinput, with no capture and so no
+  // portal session. Lets input be its own process, apart from whatever captures the desktop.
+  if env::args().any(|arg| arg == "--input-only") {
+    #[cfg(target_os = "linux")]
+    {
+      let input_tx = spawn_uinput();
+      control_input::forward_control_lines(io::stdin().lock(), move |line| input_tx.send(line).is_ok())?;
+      return Ok(());
+    }
+    #[cfg(not(target_os = "linux"))]
+    return Err("--input-only is implemented with uinput on Linux".into());
+  }
   let target_fps = argument("fps", 60_u64).clamp(1, 240);
   let port = argument("port", 12345_u16);
   let capture_token_path = PathBuf::from(argument(
