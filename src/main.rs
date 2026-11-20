@@ -26,7 +26,10 @@ const USE_RGBA_CONVERSION: bool = false; // Toggle BGRA to RGBA conversion
 fn linux_keycode(scan_hex: &str) -> Option<i32> {
   let scan = u16::from_str_radix(scan_hex.trim_start_matches("0x"), 16).ok()?;
   Some(match scan {
+    0xE01C => 96,
     0xE01D => 97,
+    0xE035 => 98,
+    0xE037 => 99,
     0xE038 => 100,
     0xE047 => 102,
     0xE048 => 103,
@@ -40,6 +43,7 @@ fn linux_keycode(scan_hex: &str) -> Option<i32> {
     0xE053 => 111,
     0xE05B => 125,
     0xE05C => 126,
+    0xE05D => 127,
     value if value <= 0x7f => value as i32,
     _ => return None,
   })
