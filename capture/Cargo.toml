@@ -1,0 +1,27 @@
+[package]
+name = "petplay-capture"
+version = "0.1.0"
+edition = "2021"
+description = "GPU screen capture for in-process encoders: frames stay on the GPU."
+
+# Only the Windows crate: an encoder linking this does not pull in scap or the
+# screen-streamer binary's dependencies. The D3D11 types are windows 0.61's, the
+# version petplay_mediatransport uses, so textures cross the crate boundary as is.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", features = [
+  "Foundation",
+  "Graphics",
+  "Graphics_Capture",
+  "Graphics_DirectX",
+  "Graphics_DirectX_Direct3D11",
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_System_WinRT",
+  "Win32_System_WinRT_Direct3D11",
+  "Win32_System_WinRT_Graphics_Capture",
+  "Win32_UI_HiDpi",
+] }
