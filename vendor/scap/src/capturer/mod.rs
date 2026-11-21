@@ -144,6 +144,27 @@ impl Capturer {
         }
     }
 
+    /// The next captured frame, or `None` when none arrives within `timeout`.
+    pub fn get_next_frame_within(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Frame>, mpsc::RecvError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let res = match self
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(res) => res,
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(mpsc::RecvError),
+            };
+            if let Some(frame) = self.engine.process_channel_item(res) {
+                return Ok(Some(frame));
+            }
+        }
+    }
+
     /// Get the dimensions the frames will be captured in
     pub fn get_output_frame_size(&mut self) -> [u32; 2] {
         self.engine.get_output_frame_size()

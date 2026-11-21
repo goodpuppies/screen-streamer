@@ -313,6 +313,20 @@ impl Capture {
     }
   }
 
+  /// The next frame, or `Idle` when the screen sent none within `timeout` (a compositor that
+  /// sends frames only on change, like GNOME's). Stitched capture always waits.
+  fn next_frame_within(&mut self, timeout: Duration) -> Result<Next, String> {
+    match self {
+      Capture::Single(capturer) => match capturer.get_next_frame_within(timeout) {
+        Ok(Some(frame)) => Ok(Next::Frame(bgra_frame(frame))),
+        Ok(None) => Ok(Next::Idle),
+        Err(e) => Err(e.to_string()),
+      },
+      #[cfg(target_os = "windows")]
+      Capture::Stitched(_) => self.next_frame().map(Next::Frame),
+    }
+  }
+
   fn next_frame(&mut self) -> Result<Option<(Vec<u8>, u32, u32)>, String> {
     match self {
       Capture::Single(capturer) => {
@@ -323,6 +337,11 @@ impl Capture {
       Capture::Stitched(stitched) => stitched.next_frame().map(Some),
     }
   }
+}
+
+enum Next {
+  Frame(Option<(Vec<u8>, u32, u32)>),
+  Idle,
 }
 
 /// Linux chooses the target interactively through the ScreenCast portal.
@@ -448,6 +467,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   const MEDIA_RETRY: Duration = Duration::from_secs(1);
   #[cfg(target_os = "linux")]
   let mut media_retry_at: Option<Instant> = None;
+  // A compositor that sends frames only on change leaves the newest picture as the last thing
+  // the encoder saw, and a browser's decoder can hold its last picture or two back until more
+  // arrive: the remote view lags one change behind until the mouse moves again. So once the
+  // screen goes still, the last frame goes out again a few times, a frame interval apart.
+  #[cfg(target_os = "linux")]
+  const IDLE_REPEATS: u32 = 4;
+  #[cfg(target_os = "linux")]
+  let idle_interval = Duration::from_millis((1000 / target_fps.max(1)).max(10));
+  #[cfg(target_os = "linux")]
+  let mut media_last: Option<Vec<u8>> = None;
+  #[cfg(target_os = "linux")]
+  let mut repeats_left = 0u32;
 
   // Calculate buffer sizes based on resolution
   println!("⚙️ Capture target: {width}x{height} @ {target_fps}fps (max)");
@@ -491,7 +522,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // If we're not currently sending, try to get a new frame
     if !is_sending {
-      match capture.next_frame() {
+      #[cfg(target_os = "linux")]
+      let next = if repeats_left > 0 && media.is_some() && media_last.is_some() {
+        capture.next_frame_within(idle_interval)
+      } else {
+        capture.next_frame().map(Next::Frame)
+      };
+      #[cfg(not(target_os = "linux"))]
+      let next = capture.next_frame().map(Next::Frame);
+      let next = match next {
+        Ok(Next::Frame(frame)) => Ok(frame),
+        Ok(Next::Idle) => {
+          #[cfg(target_os = "linux")]
+          if let (Some(producer), Some(last)) = (media.as_mut(), media_last.as_deref()) {
+            repeats_left -= 1;
+            if let Err(error) = producer.publish(last, width, height) {
+              eprintln!("⚠️ Media publishing stopped: {error}; reconnecting in {MEDIA_RETRY:?}");
+              media = None;
+              media_reported = false;
+              media_retry_at = Some(Instant::now() + MEDIA_RETRY);
+            }
+          }
+          continue;
+        }
+        Err(e) => Err(e),
+      };
+      match next {
         Ok(Some((bgra_data, frame_width, frame_height))) => {
           width = frame_width;
           height = frame_height;
@@ -547,6 +603,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(producer) = media.as_mut() {
           match producer.publish(frame_data, width, height) {
             Ok(_) => {
+              repeats_left = IDLE_REPEATS;
               if !media_reported && producer.published() > 0 {
                 media_reported = true;
                 println!("🎞️ First frame published to the media socket");
@@ -568,6 +625,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       let Some(socket) = socket.as_mut() else {
         // Nothing consumes the frame socket, so the media producer's own counters are
         // the only progress signal this session has.
+        #[cfg(target_os = "linux")]
+        if media.is_some() {
+          media_last = Some(frame_data);
+        }
         frame_count += 1;
         is_sending = false;
         if last_fps_print.elapsed().as_secs() >= 1 {
@@ -624,6 +685,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
       if send_error {
         break;
+      }
+      #[cfg(target_os = "linux")]
+      if media.is_some() {
+        media_last = Some(frame_data);
       }
 
       frame_count += 1;
