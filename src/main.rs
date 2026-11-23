@@ -1,13 +1,24 @@
+//! `screen-streamer`: single-process StageForge native actor (`protocol: 1` NDJSON over stdio)
+//! for desktop/output/window capture and Linux uinput injection.
+//!
+//! Only `--version` is accepted as a CLI probe (for build/smoke scripts); otherwise this binary
+//! speaks StageForge control messages over `stdin`/`stdout` (logs go to `stderr`) and streams
+//! pixel data over dedicated transports (TCP frame sockets and/or DMA-BUF Unix seqpacket sockets).
+
 use scap::capturer::{Capturer, Options};
 use scap::frame::{Frame, VideoFrame};
-use std::error::Error;
+use serde_json::{json, Value};
+use stageforge_actor::{Actor, ActorHandle};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{
+  atomic::{AtomicBool, Ordering},
+  mpsc, Arc, Mutex,
+};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
-use std::{env, str::FromStr};
 
 mod control_input;
 
@@ -21,8 +32,8 @@ mod windows_workspace;
 #[cfg(any(target_os = "windows", test))]
 mod workspace;
 
-const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
-const USE_RGBA_CONVERSION: bool = false; // Toggle BGRA to RGBA conversion
+const CHUNK_SIZE: usize = 256 * 1024;
+const USE_RGBA_CONVERSION: bool = false;
 
 #[cfg(target_os = "linux")]
 fn linux_keycode(scan_hex: &str) -> Option<i32> {
@@ -138,7 +149,7 @@ fn spawn_uinput() -> mpsc::Sender<String> {
             maximum: ABS_EXTENT,
             fuzz: 0,
             flat: 0,
-            resolution: 10,
+            resolution: 0,
           },
         },
         AbsoluteInfoSetup {
@@ -149,7 +160,7 @@ fn spawn_uinput() -> mpsc::Sender<String> {
             maximum: ABS_EXTENT,
             fuzz: 0,
             flat: 0,
-            resolution: 10,
+            resolution: 0,
           },
         },
       ];
@@ -164,55 +175,45 @@ fn spawn_uinput() -> mpsc::Sender<String> {
         0,
         &axes,
       )?;
-      eprintln!("uinput ready (absolute workspace pointer + keyboard)");
+      eprintln!("input: uinput keyboard and mouse ready");
 
       while let Ok(line) = rx.recv() {
-        let parts: Vec<_> = line.trim().split(',').collect();
+        let parts: Vec<&str> = line.trim().split(',').collect();
         match parts.as_slice() {
           ["M", x, y] => {
-            if let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>()) {
-              mouse.write(&[
-                event(
-                  EV_ABS,
-                  AbsoluteAxis::X as u16,
-                  (x.clamp(0.0, 1.0) * f64::from(ABS_EXTENT)) as i32,
-                ),
-                event(
-                  EV_ABS,
-                  AbsoluteAxis::Y as u16,
-                  (y.clamp(0.0, 1.0) * f64::from(ABS_EXTENT)) as i32,
-                ),
+            if let (Ok(nx), Ok(ny)) = (x.parse::<f64>(), y.parse::<f64>()) {
+              let ax = (nx.clamp(0.0, 1.0) * ABS_EXTENT as f64).round() as i32;
+              let ay = (ny.clamp(0.0, 1.0) * ABS_EXTENT as f64).round() as i32;
+              let _ = mouse.write(&[
+                event(EV_ABS, 0, ax),
+                event(EV_ABS, 1, ay),
                 event(EV_SYN, 0, 0),
-              ])?;
+              ]);
             }
           }
           ["B", button, state] => {
-            let button = match *button {
-              "left" => 0x110_u16,
-              "right" => 0x111_u16,
-              "middle" => 0x112_u16,
-              _ => continue,
+            let code = match *button {
+              "left" => Some(0x110),
+              "right" => Some(0x111),
+              "middle" => Some(0x112),
+              _ => None,
             };
-            mouse.write(&[
-              event(EV_KEY, button, i32::from(*state == "1")),
-              event(EV_SYN, 0, 0),
-            ])?;
+            if let (Some(code), Ok(val)) = (code, state.parse::<i32>()) {
+              let _ = mouse.write(&[event(EV_KEY, code, val), event(EV_SYN, 0, 0)]);
+            }
           }
           ["W", delta] => {
-            if let Ok(delta) = delta.parse::<i32>() {
-              mouse.write(&[
-                event(EV_REL, RelativeAxis::Wheel as u16, -delta),
-                event(EV_REL, RelativeAxis::WheelHiRes as u16, -delta * 120),
+            if let Ok(steps) = delta.parse::<i32>() {
+              let _ = mouse.write(&[
+                event(EV_REL, 8, -steps),
+                event(EV_REL, 11, -steps * 120),
                 event(EV_SYN, 0, 0),
-              ])?;
+              ]);
             }
           }
           ["K", scan, state] => {
-            if let Some(code) = linux_keycode(scan) {
-              keyboard.write(&[
-                event(EV_KEY, code as u16, i32::from(*state == "1")),
-                event(EV_SYN, 0, 0),
-              ])?;
+            if let (Some(code), Ok(val)) = (linux_keycode(scan), state.parse::<i32>()) {
+              let _ = keyboard.write(&[event(EV_KEY, code as u16, val), event(EV_SYN, 0, 0)]);
             }
           }
           _ => {}
@@ -220,36 +221,24 @@ fn spawn_uinput() -> mpsc::Sender<String> {
       }
       Ok(())
     })();
-    if let Err(error) = result {
-      eprintln!("uinput failed: {error}");
+    if let Err(err) = result {
+      eprintln!("input: uinput disabled: {err}");
     }
   });
   tx
 }
 
-fn argument<T: FromStr>(name: &str, fallback: T) -> T {
-  let prefix = format!("--{name}=");
-  env::args()
-    .find_map(|arg| {
-      arg
-        .strip_prefix(&prefix)
-        .and_then(|value| value.parse().ok())
-    })
-    .unwrap_or(fallback)
-}
-
 fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
   let mut rgba = Vec::with_capacity(bgra.len());
-  for chunk in bgra.chunks(4) {
-    rgba.push(chunk[2]); // R
-    rgba.push(chunk[1]); // G
-    rgba.push(chunk[0]); // B
-    rgba.push(chunk[3]); // A
+  for chunk in bgra.chunks_exact(4) {
+    rgba.push(chunk[2]);
+    rgba.push(chunk[1]);
+    rgba.push(chunk[0]);
+    rgba.push(chunk[3]);
   }
   rgba
 }
 
-/// The raw image of a video frame, or `None` for any other kind of frame.
 pub(crate) fn bgra_frame(frame: Frame) -> Option<(Vec<u8>, u32, u32)> {
   let (data, width, height) = match frame {
     Frame::Video(VideoFrame::BGRA(frame)) => (frame.data, frame.width, frame.height),
@@ -268,7 +257,8 @@ pub(crate) fn capture_options(
   fps: u64,
   token_path: &Path,
 ) -> Options {
-  Options {
+  #[cfg(target_os = "linux")]
+  let options = Options {
     fps: fps as u32,
     target,
     show_cursor: true,
@@ -276,10 +266,31 @@ pub(crate) fn capture_options(
     excluded_targets: None,
     output_type: scap::frame::FrameType::BGRAFrame,
     output_resolution: scap::capturer::Resolution::Captured,
-    crop_area: None, // Use full display area
+    crop_area: None,
     restore_token: read_restore_token(token_path),
     ..Default::default()
-  }
+  };
+  #[cfg(not(target_os = "linux"))]
+  let options = {
+    let _ = token_path;
+    Options {
+      fps: fps as u32,
+      target,
+      show_cursor: true,
+      show_highlight: false,
+      excluded_targets: None,
+      output_type: scap::frame::FrameType::BGRAFrame,
+      output_resolution: scap::capturer::Resolution::Captured,
+      crop_area: None,
+      ..Default::default()
+    }
+  };
+  options
+}
+
+enum Next {
+  Frame(Option<(Vec<u8>, u32, u32)>),
+  Idle,
 }
 
 enum Capture {
@@ -291,16 +302,15 @@ enum Capture {
 impl Capture {
   fn frame_size(&mut self) -> [u32; 2] {
     match self {
-      Capture::Single(capturer) => capturer.get_output_frame_size(),
+      Capture::Single(c) => c.get_output_frame_size(),
       #[cfg(target_os = "windows")]
-      Capture::Stitched(stitched) => stitched.frame_size(),
+      Capture::Stitched(w) => w.frame_size(),
     }
   }
 
   fn start(&mut self) {
     match self {
-      Capture::Single(capturer) => capturer.start_capture(),
-      // Each monitor's capture started with the stitcher.
+      Capture::Single(c) => c.start_capture(),
       #[cfg(target_os = "windows")]
       Capture::Stitched(_) => {}
     }
@@ -308,458 +318,453 @@ impl Capture {
 
   fn stop(&mut self) {
     match self {
-      Capture::Single(capturer) => capturer.stop_capture(),
-      // The monitor threads end with the process, right after this.
+      Capture::Single(c) => c.stop_capture(),
       #[cfg(target_os = "windows")]
       Capture::Stitched(_) => {}
     }
   }
 
-  /// The next frame, or `Idle` when the screen sent none within `timeout` (a compositor that
-  /// sends frames only on change, like GNOME's). Stitched capture always waits.
   fn next_frame_within(&mut self, timeout: Duration) -> Result<Next, String> {
     match self {
-      Capture::Single(capturer) => match capturer.get_next_frame_within(timeout) {
+      Capture::Single(c) => match c.get_next_frame_within(timeout) {
         Ok(Some(frame)) => Ok(Next::Frame(bgra_frame(frame))),
         Ok(None) => Ok(Next::Idle),
         Err(e) => Err(e.to_string()),
       },
       #[cfg(target_os = "windows")]
-      Capture::Stitched(_) => self.next_frame().map(Next::Frame),
-    }
-  }
-
-  fn next_frame(&mut self) -> Result<Option<(Vec<u8>, u32, u32)>, String> {
-    match self {
-      Capture::Single(capturer) => {
-        let frame = capturer.get_next_frame().map_err(|e| e.to_string())?;
-        Ok(bgra_frame(frame))
-      }
-      #[cfg(target_os = "windows")]
-      Capture::Stitched(stitched) => stitched.next_frame().map(Some),
+      Capture::Stitched(w) => w
+        .next_frame()
+        .map(|f| Next::Frame(Some(f)))
+        .map_err(|e| e.to_string()),
     }
   }
 }
 
-enum Next {
-  Frame(Option<(Vec<u8>, u32, u32)>),
-  Idle,
-}
-
-/// Linux chooses the target interactively through the ScreenCast portal.
-#[cfg(target_os = "linux")]
-fn open_capture(fps: u64, token_path: &Path) -> Result<Capture, Box<dyn Error>> {
-  open_single_capture(None, fps, token_path)
-}
-
-#[cfg(target_os = "windows")]
-fn open_capture(fps: u64, token_path: &Path) -> Result<Capture, Box<dyn Error>> {
-  windows_workspace::use_physical_pixels();
-  let monitors = windows_workspace::monitor_targets();
-  if env::args().any(|arg| arg == "--single-monitor") {
-    return open_single_capture(windows_workspace::first_target(monitors), fps, token_path);
+fn open_workspace_capture(fps: u64, token_path: &Path) -> Result<Capture, String> {
+  #[cfg(target_os = "windows")]
+  {
+    if let Ok(ws) = windows_workspace::StitchedCapture::open(fps, token_path) {
+      return Ok(Capture::Stitched(ws));
+    }
   }
-  if monitors.len() > 1 {
-    let stitched = windows_workspace::StitchedCapture::start(monitors, fps, token_path)?;
-    return Ok(Capture::Stitched(stitched));
-  }
-  open_single_capture(windows_workspace::first_target(monitors), fps, token_path)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn open_capture(fps: u64, token_path: &Path) -> Result<Capture, Box<dyn Error>> {
-  let target = scap::get_all_targets()
-    .into_iter()
-    .find(|t| matches!(t, scap::Target::Display(_)));
-  open_single_capture(target, fps, token_path)
-}
-
-fn open_single_capture(
-  target: Option<scap::Target>,
-  fps: u64,
-  token_path: &Path,
-) -> Result<Capture, Box<dyn Error>> {
-  let capturer = Capturer::build(capture_options(target, fps, token_path))?;
+  let opts = capture_options(None, fps, token_path);
+  let capturer = Capturer::build(opts).map_err(|e| format!("Capturer::build failed: {e:?}"))?;
+  #[cfg(target_os = "linux")]
   if let Some(token) = capturer.restore_token() {
-    save_restore_token(token_path, token)?;
+    let _ = save_restore_token(token_path, token);
   }
   Ok(Capture::Single(capturer))
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-  if env::args().any(|arg| arg == "--version") {
+enum CaptureTarget {
+  Workspace,
+  #[cfg(target_os = "linux")]
+  Output(String),
+  #[cfg(target_os = "linux")]
+  Window(String),
+}
+
+struct CaptureJob {
+  stop: Arc<AtomicBool>,
+  #[cfg(target_os = "linux")]
+  kde_stream: Option<kde_window::KdeWindowStream>,
+}
+
+impl CaptureJob {
+  fn cancel(&self) {
+    self.stop.store(true, Ordering::Relaxed);
+    #[cfg(target_os = "linux")]
+    if let Some(s) = &self.kde_stream {
+      s.close();
+    }
+  }
+}
+
+struct CaptureConfig {
+  id: String,
+  target: CaptureTarget,
+  frame_port: Option<u16>,
+  media_socket: Option<String>,
+  fps: u64,
+  token_path: PathBuf,
+  subscriber: String,
+}
+
+fn spawn_capture(
+  cfg: CaptureConfig,
+  handle: ActorHandle,
+  jobs: Arc<Mutex<HashMap<String, CaptureJob>>>,
+) -> Result<(), String> {
+  if !scap::is_supported() {
+    return Err("capture platform not supported".to_owned());
+  }
+  if !scap::has_permission() && !scap::request_permission() {
+    return Err("capture permission denied".to_owned());
+  }
+
+  let stop = Arc::new(AtomicBool::new(false));
+  #[cfg(target_os = "linux")]
+  let kde_stream = match &cfg.target {
+    CaptureTarget::Window(uuid) => Some(kde_window::open_window_stream(uuid, true)?),
+    CaptureTarget::Output(name) => Some(kde_window::open_output_stream(name, true)?),
+    CaptureTarget::Workspace => None,
+  };
+
+  #[cfg(target_os = "linux")]
+  let mut capture = if let Some(stream) = &kde_stream {
+    let mut opts = capture_options(None, cfg.fps, &cfg.token_path);
+    opts.pipewire_node_id = Some(stream.node_id);
+    Capturer::build(opts)
+      .map(Capture::Single)
+      .map_err(|e| format!("Capturer::build(pipewire) failed: {e:?}"))?
+  } else {
+    open_workspace_capture(cfg.fps, &cfg.token_path)?
+  };
+  #[cfg(not(target_os = "linux"))]
+  let mut capture = open_workspace_capture(cfg.fps, &cfg.token_path)?;
+
+  // Register job so STOP_CAPTURE / SHUTDOWN can cancel it cleanly.
+  {
+    let mut map = jobs.lock().unwrap();
+    if let Some(prev) = map.remove(&cfg.id) {
+      prev.cancel();
+    }
+    map.insert(
+      cfg.id.clone(),
+      CaptureJob {
+        stop: Arc::clone(&stop),
+        #[cfg(target_os = "linux")]
+        kde_stream: None,
+      },
+    );
+  }
+
+  let stop_bg = Arc::clone(&stop);
+  let jobs_bg = Arc::clone(&jobs);
+  thread::spawn(move || {
+    let reason = (|| -> Result<(), String> {
+      let mut socket = match cfg.frame_port {
+        Some(port) => Some(
+          TcpStream::connect(("127.0.0.1", port))
+            .map_err(|e| format!("frame socket connect 127.0.0.1:{port}: {e}"))?,
+        ),
+        None => None,
+      };
+      let [mut width, mut height] = capture.frame_size();
+      capture.start();
+      let _ = handle.post(
+        &cfg.subscriber,
+        "CAPTURE_STARTED",
+        json!({ "id": cfg.id, "width": width, "height": height }),
+      );
+
+      #[cfg(target_os = "linux")]
+      let mut media: Option<media_producer::MediaProducer> = None;
+      #[cfg(target_os = "linux")]
+      let mut media_retry_at: Option<Instant> = None;
+      #[cfg(target_os = "linux")]
+      let mut media_last: Option<Vec<u8>> = None;
+      #[cfg(target_os = "linux")]
+      let mut repeats_left = 0u32;
+      let poll_timeout = Duration::from_millis((1000 / cfg.fps.max(1)).clamp(16, 100));
+
+      while !stop_bg.load(Ordering::Relaxed) {
+        #[cfg(target_os = "linux")]
+        if kde_stream.as_ref().is_some_and(|s| s.is_closed()) {
+          break;
+        }
+        match capture.next_frame_within(poll_timeout) {
+          Ok(Next::Idle) => {
+            #[cfg(target_os = "linux")]
+            if repeats_left > 0 {
+              if let (Some(producer), Some(last)) = (media.as_mut(), media_last.as_deref()) {
+                repeats_left -= 1;
+                if producer.publish(last, width, height).is_err() {
+                  media = None;
+                  media_retry_at = Some(Instant::now() + Duration::from_secs(1));
+                }
+              }
+            }
+          }
+          Ok(Next::Frame(Some((bgra_data, fw, fh)))) => {
+            width = fw;
+            height = fh;
+            let frame_data = if USE_RGBA_CONVERSION {
+              bgra_to_rgba(&bgra_data)
+            } else {
+              bgra_data
+            };
+
+            #[cfg(target_os = "linux")]
+            if let Some(media_sock) = cfg.media_socket.as_deref() {
+              let even_w = (width & !1).max(16);
+              let even_h = (height & !1).max(16);
+              // Recreate GBM/DMA-BUF pool if the captured window resized!
+              if media
+                .as_ref()
+                .is_some_and(|p| p.geometry() != (even_w, even_h))
+              {
+                media = None;
+                media_retry_at = None;
+              }
+              if media.is_none() && media_retry_at.map_or(true, |at| Instant::now() >= at) {
+                match media_producer::MediaProducer::connect(
+                  Path::new(media_sock),
+                  Path::new("/dev/dri/renderD128"),
+                  even_w,
+                  even_h,
+                ) {
+                  Ok(p) => {
+                    media = Some(p);
+                    media_retry_at = None;
+                  }
+                  Err(_) => {
+                    media_retry_at = Some(Instant::now() + Duration::from_secs(1));
+                  }
+                }
+              }
+              if let Some(producer) = media.as_mut() {
+                if producer.publish(&frame_data, width, height).is_ok() {
+                  repeats_left = 4;
+                } else {
+                  media = None;
+                  media_retry_at = Some(Instant::now() + Duration::from_secs(1));
+                }
+              }
+            }
+
+            if let Some(sock) = socket.as_mut() {
+              let total_size = frame_data.len() as u32;
+              let num_chunks = ((total_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+              let mut metadata = [0u8; 16];
+              metadata[0..4].copy_from_slice(&width.to_le_bytes());
+              metadata[4..8].copy_from_slice(&height.to_le_bytes());
+              metadata[8..12].copy_from_slice(&total_size.to_le_bytes());
+              metadata[12..16].copy_from_slice(&num_chunks.to_le_bytes());
+              if sock.write_all(&metadata).is_err() {
+                break;
+              }
+              let mut ok = true;
+              for chunk in frame_data.chunks(CHUNK_SIZE) {
+                let len = chunk.len() as u32;
+                if sock.write_all(&len.to_le_bytes()).is_err() || sock.write_all(chunk).is_err() {
+                  ok = false;
+                  break;
+                }
+              }
+              if !ok {
+                break;
+              }
+            }
+
+            #[cfg(target_os = "linux")]
+            if media.is_some() {
+              media_last = Some(frame_data);
+            }
+          }
+          Ok(Next::Frame(None)) => sleep(Duration::from_millis(1)),
+          Err(err) => {
+            capture.stop();
+            return Err(err);
+          }
+        }
+      }
+
+      capture.stop();
+      #[cfg(target_os = "linux")]
+      if let Some(s) = kde_stream {
+        s.close();
+      }
+      Ok(())
+    })();
+
+    jobs_bg.lock().unwrap().remove(&cfg.id);
+    let _ = handle.post(
+      &cfg.subscriber,
+      "CAPTURE_ENDED",
+      json!({
+        "id": cfg.id,
+        "error": reason.err(),
+      }),
+    );
+  });
+
+  Ok(())
+}
+
+fn main() -> io::Result<()> {
+  if std::env::args().any(|a| a == "--version" || a == "-V") {
     println!("screen-streamer {}", env!("CARGO_PKG_VERSION"));
     return Ok(());
   }
+
+  let mut actor = Actor::new("screenStreamer");
+  let jobs: Arc<Mutex<HashMap<String, CaptureJob>>> = Arc::new(Mutex::new(HashMap::new()));
   #[cfg(target_os = "linux")]
-  if env::args().any(|arg| arg == "--list-windows") {
-    let windows = kde_window::list_windows().map_err(|e| io::Error::other(e))?;
-    let items: Vec<String> = windows.iter().map(|w| w.to_json()).collect();
-    println!("[{}]", items.join(","));
-    return Ok(());
-  }
-  #[cfg(target_os = "linux")]
-  {
-    let focus_uuid = argument("focus-window", String::new());
-    if !focus_uuid.is_empty() {
-      kde_window::focus_window(&focus_uuid).map_err(|e| io::Error::other(e))?;
-      return Ok(());
-    }
-  }
-  // Input injection alone: the same stdin verbs (M/B/W/K) into uinput, with no capture and so no
-  // portal session. Lets input be its own process, apart from whatever captures the desktop.
-  if env::args().any(|arg| arg == "--input-only") {
+  let uinput: Arc<Mutex<Option<mpsc::Sender<String>>>> = Arc::new(Mutex::new(None));
+
+  actor.on("LISTWINDOWS", |_ctx, _payload| {
     #[cfg(target_os = "linux")]
     {
-      let input_tx = spawn_uinput();
-      control_input::forward_control_lines(io::stdin().lock(), move |line| input_tx.send(line).is_ok())?;
-      return Ok(());
+      let wins = kde_window::list_windows()?;
+      let arr: Vec<Value> = wins
+        .into_iter()
+        .map(|w| {
+          json!({
+            "id": w.id,
+            "title": w.title,
+            "app": w.app,
+            "pid": w.pid,
+            "x": w.x,
+            "y": w.y,
+            "width": w.width,
+            "height": w.height,
+            "minimized": w.minimized,
+            "active": w.active,
+          })
+        })
+        .collect();
+      Ok(Value::Array(arr))
     }
     #[cfg(not(target_os = "linux"))]
-    return Err("--input-only is implemented with uinput on Linux".into());
-  }
-  let target_fps = argument("fps", 60_u64).clamp(1, 240);
-  let port = argument("port", 12345_u16);
-  let capture_token_path = PathBuf::from(argument(
-    "capture-token-path",
-    String::from("screen-streamer-capture.token"),
-  ));
-  // An explicit media socket publishes to the native encoder as well. The frame socket
-  // stays the default so the existing in-headset overlay keeps working unchanged.
-  #[cfg(target_os = "linux")]
-  let media_socket = argument("media-socket", String::new());
-  #[cfg(target_os = "linux")]
-  let media_render_node = PathBuf::from(argument(
-    "media-render-node",
-    String::from("/dev/dri/renderD128"),
-  ));
-  let frame_socket_wanted = !env::args().any(|arg| arg == "--no-frame-socket");
-  #[cfg(target_os = "linux")]
-  if media_socket.is_empty() && !frame_socket_wanted {
-    return Err("--no-frame-socket needs --media-socket=PATH to have any destination".into());
-  }
-  #[cfg(not(target_os = "linux"))]
-  if !frame_socket_wanted {
-    return Err("--no-frame-socket is only available with the Linux media socket".into());
-  }
-  // Check if the platform is supported
-  if !scap::is_supported() {
-    println!("❌ Platform not supported");
-    return Ok(());
-  }
+    Ok(Value::Array(Vec::new()))
+  });
 
-  // Check if we have permission to capture screen
-  if !scap::has_permission() {
-    println!("❌ Permission not granted. Requesting permission...");
-    if !scap::request_permission() {
-      println!("❌ Permission denied");
-      return Ok(());
-    }
-  }
-
-  println!("Capture backend supported; requesting a capture session...");
-
-  #[cfg(target_os = "linux")]
-  let window_uuid = argument("window", String::new());
-  #[cfg(target_os = "linux")]
-  let kde_window_stream = if !window_uuid.is_empty() {
-    let stream = kde_window::open_window_stream(&window_uuid, true).map_err(|e| io::Error::other(e))?;
-    println!("capture: KWin screencast opened PipeWire node {} for window {window_uuid}", stream.node_id);
-    Some(stream)
-  } else {
-    None
-  };
-  #[cfg(target_os = "linux")]
-  let mut capture = if let Some(stream) = &kde_window_stream {
-    let mut opts = capture_options(None, target_fps, &capture_token_path);
-    opts.pipewire_node_id = Some(stream.node_id);
-    Capture::Single(Capturer::build(opts)?)
-  } else {
-    open_capture(target_fps, &capture_token_path)?
-  };
-  #[cfg(not(target_os = "linux"))]
-  let mut capture = open_capture(target_fps, &capture_token_path)?;
-  let [mut width, mut height] = capture.frame_size();
-
-  // Connect to TCP server
-  let mut socket = if frame_socket_wanted {
-    println!("\n🔌 Connecting to 127.0.0.1:{port}");
-    let stream = TcpStream::connect(("127.0.0.1", port))?;
-    println!("✅ Connected to server");
-    Some(stream)
-  } else {
-    println!("\n🔌 Frame socket disabled; publishing to the media socket only");
-    None
-  };
-  // Created from the first captured frame, whose size can differ from the negotiated
-  // capture size, and whose odd dimensions the encoder cannot accept.
-  #[cfg(target_os = "linux")]
-  let mut media: Option<media_producer::MediaProducer> = None;
-  #[cfg(target_os = "linux")]
-  let mut media_reported = false;
-  // Media publishing is a second consumer: when its worker is missing or goes away, capture and
-  // the frame socket carry on, and the producer reconnects after this long.
-  #[cfg(target_os = "linux")]
-  const MEDIA_RETRY: Duration = Duration::from_secs(1);
-  #[cfg(target_os = "linux")]
-  let mut media_retry_at: Option<Instant> = None;
-  // A compositor that sends frames only on change leaves the newest picture as the last thing
-  // the encoder saw, and a browser's decoder can hold its last picture or two back until more
-  // arrive: the remote view lags one change behind until the mouse moves again. So once the
-  // screen goes still, the last frame goes out again a few times, a frame interval apart.
-  #[cfg(target_os = "linux")]
-  const IDLE_REPEATS: u32 = 4;
-  #[cfg(target_os = "linux")]
-  let idle_interval = Duration::from_millis((1000 / target_fps.max(1)).max(10));
-  #[cfg(target_os = "linux")]
-  let mut media_last: Option<Vec<u8>> = None;
-  #[cfg(target_os = "linux")]
-  let mut repeats_left = 0u32;
-
-  // Calculate buffer sizes based on resolution
-  println!("⚙️ Capture target: {width}x{height} @ {target_fps}fps (max)");
-
-  // Pre-allocate buffers
-  let mut current_frame: Option<Vec<u8>> = None;
-  let mut is_sending = false;
-  let mut frame_count = 0;
-  let mut dropped_frames = 0;
-  let mut last_fps_print = Instant::now();
-
-  #[cfg(target_os = "linux")]
-  let input_tx = if env::args().any(|arg| arg == "--no-input") {
-    None
-  } else {
-    Some(spawn_uinput())
-  };
-
-  // Input has its own blocking reader and uinput consumer. A slow capture or
-  // frame socket must not delay a key press/release until the next capture tick.
-  thread::spawn(move || {
+  actor.on("FOCUSWINDOW", |_ctx, payload| {
     #[cfg(target_os = "linux")]
-    let send = move |line| match &input_tx {
-      Some(tx) => tx.send(line).is_ok(),
-      None => true, // --no-input drains stdin without creating input devices
-    };
+    {
+      let id = payload
+        .get("window")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "FOCUSWINDOW needs {window}".to_owned())?;
+      kde_window::focus_window(id)?;
+      Ok(Value::Bool(true))
+    }
     #[cfg(not(target_os = "linux"))]
-    let send = |_line| true;
-    if let Err(error) = control_input::forward_control_lines(io::stdin().lock(), send) {
-      eprintln!("control input read failed: {error}");
+    {
+      let _ = payload;
+      Ok(Value::Bool(true))
     }
   });
 
-  // Start capture
-  capture.start();
-  println!("\n🎥 Started capture. Press Enter to stop...");
-  println!("\nStreaming... ");
+  {
+    let jobs = Arc::clone(&jobs);
+    actor.on("START_CAPTURE", move |ctx, payload| {
+      let id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_owned();
+      let fps = payload
+        .get("fps")
+        .and_then(Value::as_u64)
+        .unwrap_or(60)
+        .clamp(1, 240);
+      let frame_port = payload
+        .get("framePort")
+        .and_then(Value::as_u64)
+        .map(|p| p as u16);
+      let media_socket = payload
+        .get("mediaSocket")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+      let token_path = payload
+        .get("tokenPath")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("screen-streamer-capture.token"));
+      let subscriber = payload
+        .get("subscriber")
+        .and_then(Value::as_str)
+        .unwrap_or(ctx.sender)
+        .to_owned();
 
-  loop {
-    #[cfg(target_os = "linux")]
-    if kde_window_stream.as_ref().is_some_and(|s| s.is_closed()) {
-      println!("capture: KWin window stream closed");
-      break;
-    }
-    let frame_start = Instant::now();
-
-    // If we're not currently sending, try to get a new frame
-    if !is_sending {
-      #[cfg(target_os = "linux")]
-      let next = if repeats_left > 0 && media.is_some() && media_last.is_some() {
-        capture.next_frame_within(idle_interval)
-      } else {
-        capture.next_frame().map(Next::Frame)
-      };
-      #[cfg(not(target_os = "linux"))]
-      let next = capture.next_frame().map(Next::Frame);
-      let next = match next {
-        Ok(Next::Frame(frame)) => Ok(frame),
-        Ok(Next::Idle) => {
-          #[cfg(target_os = "linux")]
-          if let (Some(producer), Some(last)) = (media.as_mut(), media_last.as_deref()) {
-            repeats_left -= 1;
-            if let Err(error) = producer.publish(last, width, height) {
-              eprintln!("⚠️ Media publishing stopped: {error}; reconnecting in {MEDIA_RETRY:?}");
-              media = None;
-              media_reported = false;
-              media_retry_at = Some(Instant::now() + MEDIA_RETRY);
-            }
-          }
-          continue;
-        }
-        Err(e) => Err(e),
-      };
-      match next {
-        Ok(Some((bgra_data, frame_width, frame_height))) => {
-          width = frame_width;
-          height = frame_height;
-
-          // Convert and store the frame
-          current_frame = Some(if USE_RGBA_CONVERSION {
-            bgra_to_rgba(&bgra_data)
-          } else {
-            bgra_data
-          });
-          is_sending = true;
-        }
-        Ok(None) => {
-          println!("\n❌ Unexpected frame format");
-          sleep(Duration::from_millis(1));
-          continue;
-        }
-        Err(e) => {
-          capture.stop();
-          return Err(format!("Capture stream ended: {e}").into());
-        }
-      }
-    }
-
-    // Hand the frame to the native encoder first. It copies into GPU-visible memory
-    // and returns; a full slot pool drops the frame instead of delaying capture.
-    #[cfg(target_os = "linux")]
-    if !media_socket.is_empty() {
-      if let Some(frame_data) = current_frame.as_deref() {
-        if media.is_none() && media_retry_at.map_or(true, |at| Instant::now() >= at) {
-          println!("\n🎞️ Captured frame: {width}x{height}, {} bytes", frame_data.len());
-          match media_producer::MediaProducer::connect(
-            Path::new(&media_socket),
-            &media_render_node,
-            width & !1,
-            height & !1,
-          ) {
-            Ok(producer) => {
-              println!(
-                "\n🎞️ Media producer connected: {}x{} from a {width}x{height} capture",
-                producer.geometry().0,
-                producer.geometry().1
-              );
-              media = Some(producer);
-              media_retry_at = None;
-            }
-            Err(error) => {
-              eprintln!("⚠️ Media socket unavailable: {error}; retrying in {MEDIA_RETRY:?}");
-              media_retry_at = Some(Instant::now() + MEDIA_RETRY);
-            }
-          }
-        }
-        if let Some(producer) = media.as_mut() {
-          match producer.publish(frame_data, width, height) {
-            Ok(_) => {
-              repeats_left = IDLE_REPEATS;
-              if !media_reported && producer.published() > 0 {
-                media_reported = true;
-                println!("🎞️ First frame published to the media socket");
-              }
-            }
-            Err(error) => {
-              eprintln!("⚠️ Media publishing stopped: {error}; reconnecting in {MEDIA_RETRY:?}");
-              media = None;
-              media_reported = false;
-              media_retry_at = Some(Instant::now() + MEDIA_RETRY);
-            }
-          }
-        }
-      }
-    }
-
-    // Try to send the current frame
-    if let Some(frame_data) = current_frame.take() {
-      let Some(socket) = socket.as_mut() else {
-        // Nothing consumes the frame socket, so the media producer's own counters are
-        // the only progress signal this session has.
+      let target_obj = payload.get("target");
+      let kind = target_obj
+        .and_then(|t| t.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("workspace");
+      let target = match kind {
+        "workspace" => CaptureTarget::Workspace,
         #[cfg(target_os = "linux")]
-        if media.is_some() {
-          media_last = Some(frame_data);
+        "output" => {
+          let name = target_obj
+            .and_then(|t| t.get("output"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "output capture needs target.output".to_owned())?;
+          CaptureTarget::Output(name.to_owned())
         }
-        frame_count += 1;
-        is_sending = false;
-        if last_fps_print.elapsed().as_secs() >= 1 {
-          #[cfg(target_os = "linux")]
-          if let Some(producer) = media.as_ref() {
-            print!(
-              "\r🎬 FPS: {:.1} | published: {} | dropped: {}    ",
-              frame_count as f64 / last_fps_print.elapsed().as_secs_f64(),
-              producer.published(),
-              producer.dropped()
-            );
-            io::stdout().flush().unwrap();
-          }
-          frame_count = 0;
-          last_fps_print = Instant::now();
+        #[cfg(target_os = "linux")]
+        "window" => {
+          let win = target_obj
+            .and_then(|t| t.get("window"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "window capture needs target.window".to_owned())?;
+          CaptureTarget::Window(win.to_owned())
         }
-        continue;
+        other => return Err(format!("unsupported capture target kind: {other}")),
       };
-      // Send frame metadata
-      let total_size = frame_data.len() as u32;
-      let num_chunks = ((total_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
-      let metadata = [
-        width.to_le_bytes(),
-        height.to_le_bytes(),
-        total_size.to_le_bytes(),
-        num_chunks.to_le_bytes(),
-      ]
-      .concat();
 
-      if let Err(e) = socket.write_all(&metadata) {
-        println!("\n❌ Connection error on metadata: {:?}", e);
-        break;
-      }
-
-      // Send the frame data in chunks
-      let mut send_error = false;
-
-      for chunk in frame_data.chunks(CHUNK_SIZE) {
-        // Send chunk size first
-        let chunk_size = chunk.len() as u32;
-        if let Err(e) = socket.write_all(&chunk_size.to_le_bytes()) {
-          println!("\n❌ Connection error on chunk size: {:?}", e);
-          send_error = true;
-          break;
-        }
-
-        // Then send chunk data
-        if let Err(e) = socket.write_all(chunk) {
-          println!("\n❌ Connection error on chunk data: {:?}", e);
-          send_error = true;
-          break;
-        }
-      }
-
-      if send_error {
-        break;
-      }
-      #[cfg(target_os = "linux")]
-      if media.is_some() {
-        media_last = Some(frame_data);
-      }
-
-      frame_count += 1;
-      is_sending = false;
-
-      // Print FPS and stats every second
-      if last_fps_print.elapsed().as_secs() >= 1 {
-        let fps = frame_count as f64 / last_fps_print.elapsed().as_secs_f64();
-        let latency = frame_start.elapsed().as_millis() as f64;
-        let drop_rate = (dropped_frames as f64 / (frame_count + dropped_frames) as f64) * 100.0;
-
-        print!(
-          "\r🎬 FPS: {:.1} | Latency: {:.1}ms | Dropped: {}/{} ({:.1}%)    ",
+      spawn_capture(
+        CaptureConfig {
+          id: id.clone(),
+          target,
+          frame_port,
+          media_socket,
           fps,
-          latency,
-          dropped_frames,
-          frame_count + dropped_frames,
-          drop_rate
-        );
-        io::stdout().flush().unwrap();
-
-        frame_count = 0;
-        dropped_frames = 0;
-        last_fps_print = Instant::now();
-      }
-    }
+          token_path,
+          subscriber,
+        },
+        ctx.handle.clone(),
+        Arc::clone(&jobs),
+      )?;
+      Ok(json!({ "id": id }))
+    });
   }
 
-  // Stop Capture
-  capture.stop();
-  println!("\n👋 Capture stopped");
-  Ok(())
+  {
+    let jobs = Arc::clone(&jobs);
+    actor.on("STOP_CAPTURE", move |_ctx, payload| {
+      let id = payload.get("id").and_then(Value::as_str);
+      let mut map = jobs.lock().unwrap();
+      if let Some(id) = id {
+        if let Some(job) = map.remove(id) {
+          job.cancel();
+        }
+      } else {
+        for (_, job) in map.drain() {
+          job.cancel();
+        }
+      }
+      Ok(Value::Bool(true))
+    });
+  }
+
+  #[cfg(target_os = "linux")]
+  {
+    let uinput = Arc::clone(&uinput);
+    actor.on("INPUT", move |_ctx, payload| {
+      let line = payload
+        .as_str()
+        .or_else(|| payload.get("line").and_then(Value::as_str))
+        .ok_or_else(|| "INPUT needs a control line string".to_owned())?
+        .to_owned();
+      let mut guard = uinput.lock().unwrap();
+      let tx = guard.get_or_insert_with(spawn_uinput);
+      let _ = tx.send(line);
+      Ok(Value::Bool(true))
+    });
+  }
+
+  {
+    let jobs = Arc::clone(&jobs);
+    actor.on_shutdown(move || {
+      for (_, job) in jobs.lock().unwrap().drain() {
+        job.cancel();
+      }
+    });
+  }
+
+  actor.run_stdio()
 }

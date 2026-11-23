@@ -18,7 +18,8 @@ use std::sync::{
 use std::thread;
 
 use wayland_client::{
-  protocol::wl_registry, Connection, Dispatch, EventQueue, Proxy, QueueHandle,
+  protocol::{wl_output, wl_registry},
+  Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
 use wayland_protocols_plasma::plasma_window_management::client::{
   org_kde_plasma_window::{self, OrgKdePlasmaWindow},
@@ -323,6 +324,173 @@ impl KdeWindowStream {
   pub fn is_closed(&self) -> bool {
     self.closed.load(Ordering::Relaxed)
   }
+
+  pub fn close(&self) {
+    self.closed.store(true, Ordering::Relaxed);
+  }
+}
+
+struct OutputScreencastState {
+  screencast: Option<ZkdeScreencastV1>,
+  outputs: Vec<(wl_output::WlOutput, Option<String>)>,
+  node_tx: Option<mpsc::Sender<Result<u32, String>>>,
+  closed: Arc<AtomicBool>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for OutputScreencastState {
+  fn event(
+    state: &mut Self,
+    registry: &wl_registry::WlRegistry,
+    event: wl_registry::Event,
+    _: &(),
+    _: &Connection,
+    qh: &QueueHandle<Self>,
+  ) {
+    if let wl_registry::Event::Global {
+      name,
+      interface,
+      version,
+    } = event
+    {
+      if interface == ZkdeScreencastV1::interface().name {
+        let bind_ver = version.min(4);
+        state.screencast = Some(registry.bind::<ZkdeScreencastV1, _, _>(name, bind_ver, qh, ()));
+      } else if interface == wl_output::WlOutput::interface().name {
+        let idx = state.outputs.len();
+        let out = registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, idx);
+        state.outputs.push((out, None));
+      }
+    }
+  }
+}
+
+impl Dispatch<wl_output::WlOutput, usize> for OutputScreencastState {
+  fn event(
+    state: &mut Self,
+    _: &wl_output::WlOutput,
+    event: wl_output::Event,
+    idx: &usize,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+  ) {
+    if let wl_output::Event::Name { name } = event {
+      if let Some(entry) = state.outputs.get_mut(*idx) {
+        entry.1 = Some(name);
+      }
+    }
+  }
+}
+
+impl Dispatch<ZkdeScreencastV1, ()> for OutputScreencastState {
+  fn event(
+    _: &mut Self,
+    _: &ZkdeScreencastV1,
+    _: zkde_screencast_unstable_v1::Event,
+    _: &(),
+    _: &Connection,
+    _: &QueueHandle<Self>,
+  ) {
+  }
+}
+
+impl Dispatch<ZkdeScreencastStreamV1, ()> for OutputScreencastState {
+  fn event(
+    state: &mut Self,
+    _: &ZkdeScreencastStreamV1,
+    event: zkde_screencast_stream_unstable_v1::Event,
+    _: &(),
+    _: &Connection,
+    _: &QueueHandle<Self>,
+  ) {
+    match event {
+      zkde_screencast_stream_unstable_v1::Event::Created { node } => {
+        if let Some(tx) = state.node_tx.take() {
+          let _ = tx.send(Ok(node));
+        }
+      }
+      zkde_screencast_stream_unstable_v1::Event::Failed { error } => {
+        state.closed.store(true, Ordering::Relaxed);
+        if let Some(tx) = state.node_tx.take() {
+          let _ = tx.send(Err(format!("KWin output screencast failed: {error}")));
+        }
+      }
+      zkde_screencast_stream_unstable_v1::Event::Closed => {
+        state.closed.store(true, Ordering::Relaxed);
+      }
+      _ => {}
+    }
+  }
+}
+
+/// Open a direct zero-popup KWin PipeWire screencast for a single monitor output by name (e.g. "DP-1").
+pub fn open_output_stream(output_name: &str, show_cursor: bool) -> Result<KdeWindowStream, String> {
+  let target_name = output_name.to_owned();
+  let (tx, rx) = mpsc::channel::<Result<u32, String>>();
+  let closed = Arc::new(AtomicBool::new(false));
+  let closed_bg = closed.clone();
+
+  thread::spawn(move || {
+    let res = (|| -> Result<(), String> {
+      let conn = Connection::connect_to_env()
+        .map_err(|e| format!("Wayland connect failed: {e}"))?;
+      let mut queue: EventQueue<OutputScreencastState> = conn.new_event_queue();
+      let qh = queue.handle();
+      let _registry = conn.display().get_registry(&qh, ());
+      let mut state = OutputScreencastState {
+        screencast: None,
+        outputs: Vec::new(),
+        node_tx: Some(tx.clone()),
+        closed: closed_bg.clone(),
+      };
+      // Two roundtrips: first binds wl_output globals, second receives wl_output::name events.
+      queue
+        .roundtrip(&mut state)
+        .map_err(|e| format!("Wayland registry roundtrip failed: {e}"))?;
+      queue
+        .roundtrip(&mut state)
+        .map_err(|e| format!("Wayland output roundtrip failed: {e}"))?;
+      let screencast = state.screencast.as_ref().ok_or_else(|| {
+        "zkde_screencast_unstable_v1 not available (install petplay-screen-streamer.kwin.desktop in /usr/share/applications/)"
+          .to_owned()
+      })?;
+      let (output, _) = state
+        .outputs
+        .iter()
+        .find(|(_, name)| name.as_deref() == Some(target_name.as_str()))
+        .ok_or_else(|| {
+          let available: Vec<_> = state
+            .outputs
+            .iter()
+            .filter_map(|(_, n)| n.as_deref())
+            .collect();
+          format!("KDE output '{target_name}' not found (available: {available:?})")
+        })?;
+      let pointer = if show_cursor {
+        zkde_screencast_unstable_v1::Pointer::Embedded as u32
+      } else {
+        zkde_screencast_unstable_v1::Pointer::Hidden as u32
+      };
+      let _stream = screencast.stream_output(output, pointer, &qh, ());
+      conn.flush().map_err(|e| format!("Wayland flush failed: {e}"))?;
+
+      while !closed_bg.load(Ordering::Relaxed) {
+        if let Err(e) = queue.blocking_dispatch(&mut state) {
+          closed_bg.store(true, Ordering::Relaxed);
+          return Err(format!("Wayland output screencast dispatch ended: {e}"));
+        }
+      }
+      Ok(())
+    })();
+    if let Err(err) = res {
+      closed_bg.store(true, Ordering::Relaxed);
+      let _ = tx.send(Err(err));
+    }
+  });
+
+  let node_id = rx
+    .recv()
+    .map_err(|_| "Wayland output screencast thread exited before returning a node".to_owned())??;
+  Ok(KdeWindowStream { node_id, closed })
 }
 
 pub fn open_window_stream(uuid: &str, show_cursor: bool) -> Result<KdeWindowStream, String> {
