@@ -75,6 +75,8 @@ pub struct Options {
     pub exclude_current_process_audio: bool,
     /// Linux portal restore token used to restore the previous source selection.
     pub restore_token: Option<String>,
+    /// Direct PipeWire node ID (e.g. from KDE `zkde_screencast_unstable_v1`), bypassing the portal.
+    pub pipewire_node_id: Option<u32>,
 }
 
 /// Screen capturer class

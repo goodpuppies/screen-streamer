@@ -14,6 +14,8 @@ libc = "0.2"
 # Linear GBM buffers are CPU-writable and DMA-BUF exportable, so a captured frame
 # reaches the GPU encoder through its strict DMA-BUF contract.
 gbm = { version = "0.18", default-features = false }
+wayland-client = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 
 [workspace]
 members = ["vendor/scap", "capture"]

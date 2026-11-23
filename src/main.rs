@@ -12,6 +12,8 @@ use std::{env, str::FromStr};
 mod control_input;
 
 #[cfg(target_os = "linux")]
+mod kde_window;
+#[cfg(target_os = "linux")]
 mod media_producer;
 
 #[cfg(target_os = "windows")]
@@ -389,6 +391,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("screen-streamer {}", env!("CARGO_PKG_VERSION"));
     return Ok(());
   }
+  #[cfg(target_os = "linux")]
+  if env::args().any(|arg| arg == "--list-windows") {
+    let windows = kde_window::list_windows().map_err(|e| io::Error::other(e))?;
+    let items: Vec<String> = windows.iter().map(|w| w.to_json()).collect();
+    println!("[{}]", items.join(","));
+    return Ok(());
+  }
+  #[cfg(target_os = "linux")]
+  {
+    let focus_uuid = argument("focus-window", String::new());
+    if !focus_uuid.is_empty() {
+      kde_window::focus_window(&focus_uuid).map_err(|e| io::Error::other(e))?;
+      return Ok(());
+    }
+  }
   // Input injection alone: the same stdin verbs (M/B/W/K) into uinput, with no capture and so no
   // portal session. Lets input be its own process, apart from whatever captures the desktop.
   if env::args().any(|arg| arg == "--input-only") {
@@ -442,6 +459,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   println!("Capture backend supported; requesting a capture session...");
 
+  #[cfg(target_os = "linux")]
+  let window_uuid = argument("window", String::new());
+  #[cfg(target_os = "linux")]
+  let kde_window_stream = if !window_uuid.is_empty() {
+    let stream = kde_window::open_window_stream(&window_uuid, true).map_err(|e| io::Error::other(e))?;
+    println!("capture: KWin screencast opened PipeWire node {} for window {window_uuid}", stream.node_id);
+    Some(stream)
+  } else {
+    None
+  };
+  #[cfg(target_os = "linux")]
+  let mut capture = if let Some(stream) = &kde_window_stream {
+    let mut opts = capture_options(None, target_fps, &capture_token_path);
+    opts.pipewire_node_id = Some(stream.node_id);
+    Capture::Single(Capturer::build(opts)?)
+  } else {
+    open_capture(target_fps, &capture_token_path)?
+  };
+  #[cfg(not(target_os = "linux"))]
   let mut capture = open_capture(target_fps, &capture_token_path)?;
   let [mut width, mut height] = capture.frame_size();
 
@@ -518,6 +554,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   println!("\nStreaming... ");
 
   loop {
+    #[cfg(target_os = "linux")]
+    if kde_window_stream.as_ref().is_some_and(|s| s.is_closed()) {
+      println!("capture: KWin window stream closed");
+      break;
+    }
     let frame_start = Instant::now();
 
     // If we're not currently sending, try to get a new frame

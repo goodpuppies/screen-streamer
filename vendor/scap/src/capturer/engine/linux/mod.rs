@@ -157,13 +157,16 @@ fn pipewire_capturer(
     tx: mpsc::Sender<Frame>,
     ready_sender: &SyncSender<bool>,
     stream_id: u32,
-    remote: OwnedFd,
+    remote: Option<OwnedFd>,
 ) -> Result<(), LinCapError> {
     pw::init();
 
     let mainloop = MainLoopRc::new(None)?;
     let context = ContextRc::new(&mainloop, None)?;
-    let core = context.connect_fd_rc(remote, None)?;
+    let core = match remote {
+        Some(fd) => context.connect_fd_rc(fd, None)?,
+        None => context.connect_rc(None)?,
+    };
 
     // The portal can return while permissions/global announcements are still in flight.
     // Wait until its source is visible on this restricted remote before targeting it.
@@ -323,22 +326,29 @@ fn pipewire_capturer(
 pub struct LinuxCapturer {
     capturer_join_handle: Option<JoinHandle<Result<(), LinCapError>>>,
     // The pipewire stream is deleted when the connection is dropped.
-    // That's why we keep it alive
-    _connection: dbus::blocking::Connection,
+    // That's why we keep it alive (None when targeting a direct PipeWire node).
+    _connection: Option<dbus::blocking::Connection>,
     restore_token: Option<String>,
 }
 
 impl LinuxCapturer {
     // TODO: Error handling
     pub fn new(options: &Options, tx: mpsc::Sender<Frame>) -> Result<Self, LinCapError> {
-        let connection = dbus::blocking::Connection::new_session().map_err(|e|
-            LinCapError::new(format!("Cannot connect to the capture session bus; launch from the graphical session or configure its bus address: {e}")))?;
-        let (portal_stream, restore_token, remote) = ScreenCastPortal::new(&connection)?
-            .show_cursor(options.show_cursor)?
-            .restore_token(options.restore_token.clone())
-            .create_stream()?;
-        let stream_id = portal_stream.pw_node_id();
-        eprintln!("capture: portal selected PipeWire node {stream_id}");
+        let (connection, stream_id, restore_token, remote) =
+            if let Some(node_id) = options.pipewire_node_id {
+                eprintln!("capture: targeting direct PipeWire node {node_id}");
+                (None, node_id, None, None)
+            } else {
+                let connection = dbus::blocking::Connection::new_session().map_err(|e|
+                    LinCapError::new(format!("Cannot connect to the capture session bus; launch from the graphical session or configure its bus address: {e}")))?;
+                let (portal_stream, restore_token, remote) = ScreenCastPortal::new(&connection)?
+                    .show_cursor(options.show_cursor)?
+                    .restore_token(options.restore_token.clone())
+                    .create_stream()?;
+                let stream_id = portal_stream.pw_node_id();
+                eprintln!("capture: portal selected PipeWire node {stream_id}");
+                (Some(connection), stream_id, restore_token, Some(remote))
+            };
 
         // TODO: Fix this hack
         let options = options.clone();
@@ -354,7 +364,7 @@ impl LinuxCapturer {
 
         if ready_recv.recv() != Ok(true) {
             return Err(LinCapError::new(
-                "Failed to initialize the portal PipeWire remote".into(),
+                "Failed to initialize the PipeWire capture stream".into(),
             ));
         }
 
