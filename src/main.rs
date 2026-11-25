@@ -343,17 +343,26 @@ impl Capture {
 fn open_workspace_capture(fps: u64, token_path: &Path) -> Result<Capture, String> {
   #[cfg(target_os = "windows")]
   {
-    if let Ok(ws) = windows_workspace::StitchedCapture::open(fps, token_path) {
-      return Ok(Capture::Stitched(ws));
+    let monitors = windows_workspace::monitor_targets();
+    if monitors.len() > 1 {
+      let stitched = windows_workspace::StitchedCapture::start(monitors, fps, token_path)
+        .map_err(|e| format!("StitchedCapture::start failed: {e}"))?;
+      return Ok(Capture::Stitched(stitched));
     }
+    let opts = capture_options(windows_workspace::first_target(monitors), fps, token_path);
+    let capturer = Capturer::build(opts).map_err(|e| format!("Capturer::build failed: {e:?}"))?;
+    return Ok(Capture::Single(capturer));
   }
-  let opts = capture_options(None, fps, token_path);
-  let capturer = Capturer::build(opts).map_err(|e| format!("Capturer::build failed: {e:?}"))?;
-  #[cfg(target_os = "linux")]
-  if let Some(token) = capturer.restore_token() {
-    let _ = save_restore_token(token_path, token);
+  #[cfg(not(target_os = "windows"))]
+  {
+    let opts = capture_options(None, fps, token_path);
+    let capturer = Capturer::build(opts).map_err(|e| format!("Capturer::build failed: {e:?}"))?;
+    #[cfg(target_os = "linux")]
+    if let Some(token) = capturer.restore_token() {
+      let _ = save_restore_token(token_path, token);
+    }
+    Ok(Capture::Single(capturer))
   }
-  Ok(Capture::Single(capturer))
 }
 
 enum CaptureTarget {
@@ -420,8 +429,6 @@ fn spawn_capture(
   } else {
     open_workspace_capture(cfg.fps, &cfg.token_path)?
   };
-  #[cfg(not(target_os = "linux"))]
-  let mut capture = open_workspace_capture(cfg.fps, &cfg.token_path)?;
 
   // Register job so STOP_CAPTURE / SHUTDOWN can cancel it cleanly.
   {
@@ -443,6 +450,10 @@ fn spawn_capture(
   let jobs_bg = Arc::clone(&jobs);
   thread::spawn(move || {
     let reason = (|| -> Result<(), String> {
+      // On Windows, scap::Capturer holds !Send WinRT/COM pointers and must be created on the
+      // capture thread that drives it.
+      #[cfg(not(target_os = "linux"))]
+      let mut capture = open_workspace_capture(cfg.fps, &cfg.token_path)?;
       let mut socket = match cfg.frame_port {
         Some(port) => Some(
           TcpStream::connect(("127.0.0.1", port))
